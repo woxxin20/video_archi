@@ -1,0 +1,180 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:shelf/shelf.dart';
+import 'package:shelf/shelf_io.dart' as shelf_io;
+import 'package:shelf_router/shelf_router.dart';
+
+// ─── Global State ───
+late Map<String, dynamic> _videosConfig;
+late Map<String, Map<String, String>> _contentMap;
+late Map<String, int> _videoDurations;
+late Map<String, List<String>> _videoLanguages;
+late String _catalogVersion;
+String _cdnBaseUrl = 'https://cdn.example.com';
+final Map<String, Map<String, dynamic>> _catalogCache = {};
+
+void main(List<String> args) async {
+  final port = int.tryParse(Platform.environment['PORT'] ?? '') ?? 8080;
+  if (args.isNotEmpty) _cdnBaseUrl = args[0];
+
+  await _loadConfigs();
+
+  final router = Router();
+  router.get('/api/catalog', _handleCatalog);
+  router.get('/api/catalog_version', _handleCatalogVersion);
+
+  final handler = const Pipeline()
+      .addMiddleware(logRequests())
+      .addMiddleware(_cors())
+      .addHandler(router.call);
+
+  final server = await shelf_io.serve(handler, InternetAddress.anyIPv4, port);
+  print('✅ Server running on http://localhost:${server.port}');
+  print('   CDN: $_cdnBaseUrl | Version: $_catalogVersion');
+}
+
+// ─── CORS ───
+Middleware _cors() => (Handler h) => (Request r) async {
+      if (r.method == 'OPTIONS') {
+        return Response.ok('', headers: _ch);
+      }
+      return (await h(r)).change(headers: _ch);
+    };
+
+const _ch = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+// ─── Load Configs ───
+Future<void> _loadConfigs() async {
+  // Resolve server root: script is at server/bin/server.dart
+  // Go up from bin/ to server/
+  final scriptDir = File(Platform.script.toFilePath()).parent.path;
+  final root = Directory(scriptDir).parent.path;
+
+  _videosConfig = jsonDecode(await File('$root/videos.json').readAsString());
+  _catalogVersion = _videosConfig['catalog_version'] as String;
+
+  // Durations
+  final dRaw = jsonDecode(await File('$root/video_durations.json').readAsString()) as Map<String, dynamic>;
+  _videoDurations = {};
+  for (final m in dRaw.keys) {
+    for (final c in (dRaw[m] as Map<String, dynamic>).keys) {
+      for (final id in ((dRaw[m] as Map)[c] as Map<String, dynamic>).keys) {
+        _videoDurations['$m/$c/$id'] = ((dRaw[m] as Map)[c] as Map)[id] as int;
+      }
+    }
+  }
+
+  // Video languages
+  final lRaw = jsonDecode(await File('$root/video_languages.json').readAsString()) as Map<String, dynamic>;
+  _videoLanguages = lRaw.map((k, v) => MapEntry(k, (v as List).cast<String>()));
+
+  // Content translations
+  _contentMap = {};
+  final langsDir = Directory('$root/content/langs');
+  if (await langsDir.exists()) {
+    await for (final f in langsDir.list()) {
+      if (f is File && f.path.endsWith('.json')) {
+        final m = RegExp(r'content\.(\w+)\.json').firstMatch(f.uri.pathSegments.last);
+        if (m != null) {
+          final lang = m.group(1)!;
+          final data = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+          _contentMap[lang] = data.cast<String, String>();
+          print('   Loaded lang: $lang (${data.length} keys)');
+        }
+      }
+    }
+  }
+  print('   ${_videoDurations.length} durations, ${_videoLanguages.length} video-lang mappings');
+}
+
+// ─── GET /api/catalog_version ───
+Response _handleCatalogVersion(Request request) {
+  final mode = request.url.queryParameters['mode'];
+  if (mode == null || !['period', 'pregnancy'].contains(mode)) {
+    return Response(400,
+        body: jsonEncode({'error': 'Invalid mode'}),
+        headers: {'Content-Type': 'application/json'});
+  }
+  return Response.ok(
+      jsonEncode({'mode': mode, 'catalog_version': _catalogVersion}),
+      headers: {'Content-Type': 'application/json'});
+}
+
+// ─── GET /api/catalog ───
+Response _handleCatalog(Request request) {
+  final mode = request.url.queryParameters['mode'];
+  final lang = request.url.queryParameters['lang'] ?? 'en';
+  if (mode == null || !['period', 'pregnancy'].contains(mode)) {
+    return Response(400,
+        body: jsonEncode({'error': 'Invalid mode'}),
+        headers: {'Content-Type': 'application/json'});
+  }
+
+  final ck = '$mode:$lang:$_catalogVersion';
+  if (_catalogCache.containsKey(ck)) {
+    return Response.ok(jsonEncode(_catalogCache[ck]),
+        headers: {'Content-Type': 'application/json'});
+  }
+
+  final catalog = _buildCatalog(mode, lang);
+  _catalogCache[ck] = catalog;
+  return Response.ok(jsonEncode(catalog),
+      headers: {'Content-Type': 'application/json'});
+}
+
+// ─── Build Catalog ───
+Map<String, dynamic> _buildCatalog(String mode, String reqLang) {
+  final modeData = _videosConfig[mode] as Map<String, dynamic>;
+  final langResolved = _contentMap.containsKey(reqLang) ? reqLang : 'en';
+  final categories = <String, dynamic>{};
+
+  for (final cat in modeData.keys) {
+    final ids = (modeData[cat] as List).cast<String>();
+    final videos = <Map<String, dynamic>>[];
+    for (final id in ids) {
+      final fid = '$mode/$cat/$id';
+      final tKey = '${mode}_${cat}_${id}_title';
+      final dKey = '${mode}_${cat}_${id}_desc';
+      final vLang = _resolveVideoLang(fid, reqLang);
+
+      videos.add({
+        'id': id,
+        'full_id': fid,
+        'title': _resolveText(tKey, langResolved),
+        'description': _resolveText(dKey, langResolved),
+        'duration_sec': _videoDurations[fid] ?? 60,
+        'video_url': '$_cdnBaseUrl/videos/$fid/$vLang.mp4',
+        'thumbnail_url': '$_cdnBaseUrl/videos/$fid/thumb.jpg',
+        'video_lang_resolved': vLang,
+        'active': true,
+      });
+    }
+    categories[cat] = {'total': ids.length, 'videos': videos};
+  }
+
+  return {
+    'mode': mode,
+    'lang': reqLang,
+    'lang_resolved': langResolved,
+    'catalog_version': _catalogVersion,
+    'categories': categories,
+  };
+}
+
+String _resolveText(String key, String lang) {
+  if (_contentMap[lang]?.containsKey(key) == true) return _contentMap[lang]![key]!;
+  if (_contentMap['en']?.containsKey(key) == true) return _contentMap['en']![key]!;
+  return key;
+}
+
+String _resolveVideoLang(String fullId, String reqLang) {
+  final avail = _videoLanguages[fullId] ?? ['en'];
+  if (avail.contains(reqLang)) return reqLang;
+  if (avail.contains('hi')) return 'hi';
+  return 'en';
+}
