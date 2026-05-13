@@ -1,13 +1,13 @@
-import 'package:video_player/video_player.dart';
+import 'package:better_player_plus/better_player_plus.dart';
 import '../models/video_item.dart';
 
 /// Handles pre-initialization of video controllers to ensure near-instant playback.
-/// Implements Section 14: "Video Pre-Initialization".
+/// Implements Section 14: "Video Pre-Initialization" with HLS support.
 class VideoPreloadService {
-  VideoPlayerController? _preloadedController;
+  BetterPlayerController? _preloadedController;
   String? _preloadedVideoId;
 
-  VideoPlayerController? get preloadedController => _preloadedController;
+  BetterPlayerController? get preloadedController => _preloadedController;
   String? get preloadedVideoId => _preloadedVideoId;
 
   /// Pre-initializes a video controller for the given video.
@@ -20,11 +20,33 @@ class VideoPreloadService {
     await dispose();
 
     _preloadedVideoId = video.id;
-    _preloadedController = VideoPlayerController.networkUrl(Uri.parse(video.videoUrl));
+
+    // ── Data source: HLS master playlist ─────────────────────────────
+    final dataSource = BetterPlayerDataSource(
+      BetterPlayerDataSourceType.network,
+      video.streamUrl,
+      videoFormat: BetterPlayerVideoFormat.hls,
+      cacheConfiguration: BetterPlayerCacheConfiguration(
+        useCache: true,
+        maxCacheSize: 20 * 1024 * 1024, // 20MB cache for preload
+        maxCacheFileSize: 10 * 1024 * 1024, // 10MB per video
+      ),
+    );
+
+    // ── Player configuration ──────────────────────────────────────────
+    final config = BetterPlayerConfiguration(
+      autoPlay: false, // Don't auto-play preloaded content
+      looping: false,
+      controlsConfiguration: BetterPlayerControlsConfiguration(
+        showControls: false, // Hide controls for preloaded content
+      ),
+    );
+
+    _preloadedController = BetterPlayerController(config);
 
     try {
-      await _preloadedController!.initialize();
-      // Start buffering but don't play
+      await _preloadedController!.setupDataSource(dataSource);
+      // HLS stream will start buffering but won't play
     } catch (e) {
       // If preload fails, just clear it so we don't try to use a broken controller
       await dispose();
@@ -33,7 +55,7 @@ class VideoPreloadService {
 
   /// Take ownership of the preloaded controller.
   /// The caller is responsible for disposing it.
-  VideoPlayerController? consume(String videoId) {
+  BetterPlayerController? consume(String videoId) {
     if (_preloadedVideoId == videoId) {
       final controller = _preloadedController;
       _preloadedController = null;
@@ -44,7 +66,7 @@ class VideoPreloadService {
   }
 
   Future<void> dispose() async {
-    await _preloadedController?.dispose();
+    _preloadedController?.dispose();
     _preloadedController = null;
     _preloadedVideoId = null;
   }

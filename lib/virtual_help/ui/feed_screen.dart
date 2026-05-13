@@ -47,15 +47,19 @@ class _FeedScreenState extends State<FeedScreen> {
 
         return Scaffold(
           appBar: AppBar(
-            title: Text(provider.currentMode == 'period'
-                ? 'Period Care'
-                : 'Pregnancy Care'),
+            title: Text(
+              provider.currentMode == 'period'
+                  ? 'Period Care'
+                  : 'Pregnancy Care',
+            ),
             actions: [
               // Mode switch button
               IconButton(
-                icon: Icon(provider.currentMode == 'period'
-                    ? Icons.pregnant_woman
-                    : Icons.favorite),
+                icon: Icon(
+                  provider.currentMode == 'period'
+                      ? Icons.pregnant_woman
+                      : Icons.favorite,
+                ),
                 tooltip: provider.currentMode == 'period'
                     ? 'Switch to Pregnancy'
                     : 'Switch to Period',
@@ -73,17 +77,19 @@ class _FeedScreenState extends State<FeedScreen> {
                 onSelected: (lang) => provider.changeLanguage(lang),
                 itemBuilder: (context) {
                   return VirtualHelpConfig.supportedLanguages
-                      .map((lang) => PopupMenuItem(
-                            value: lang,
-                            child: Text(
-                              lang.toUpperCase(),
-                              style: TextStyle(
-                                fontWeight: lang == provider.currentLang
-                                    ? FontWeight.bold
-                                    : FontWeight.normal,
-                              ),
+                      .map(
+                        (lang) => PopupMenuItem(
+                          value: lang,
+                          child: Text(
+                            lang.toUpperCase(),
+                            style: TextStyle(
+                              fontWeight: lang == provider.currentLang
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
                             ),
-                          ))
+                          ),
+                        ),
+                      )
                       .toList();
                 },
               ),
@@ -95,9 +101,7 @@ class _FeedScreenState extends State<FeedScreen> {
               _buildCategoryPills(provider),
 
               // ─── Video Feed ───
-              Expanded(
-                child: _buildVideoFeed(provider),
-              ),
+              Expanded(child: _buildVideoFeed(provider)),
             ],
           ),
         );

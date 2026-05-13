@@ -11,7 +11,7 @@ late Map<String, Map<String, String>> _contentMap;
 late Map<String, int> _videoDurations;
 late Map<String, List<String>> _videoLanguages;
 late String _catalogVersion;
-String _cdnBaseUrl = 'https://cdn.example.com';
+String _cdnBaseUrl = 'http://192.168.1.104';
 final Map<String, Map<String, dynamic>> _catalogCache = {};
 
 void main(List<String> args) async {
@@ -59,7 +59,9 @@ Future<void> _loadConfigs() async {
   _catalogVersion = _videosConfig['catalog_version'] as String;
 
   // Durations
-  final dRaw = jsonDecode(await File('$root/video_durations.json').readAsString()) as Map<String, dynamic>;
+  final dRaw =
+      jsonDecode(await File('$root/video_durations.json').readAsString())
+          as Map<String, dynamic>;
   _videoDurations = {};
   for (final m in dRaw.keys) {
     for (final c in (dRaw[m] as Map<String, dynamic>).keys) {
@@ -70,7 +72,9 @@ Future<void> _loadConfigs() async {
   }
 
   // Video languages
-  final lRaw = jsonDecode(await File('$root/video_languages.json').readAsString()) as Map<String, dynamic>;
+  final lRaw =
+      jsonDecode(await File('$root/video_languages.json').readAsString())
+          as Map<String, dynamic>;
   _videoLanguages = lRaw.map((k, v) => MapEntry(k, (v as List).cast<String>()));
 
   // Content translations
@@ -79,17 +83,20 @@ Future<void> _loadConfigs() async {
   if (await langsDir.exists()) {
     await for (final f in langsDir.list()) {
       if (f is File && f.path.endsWith('.json')) {
-        final m = RegExp(r'content\.(\w+)\.json').firstMatch(f.uri.pathSegments.last);
+        final m =
+            RegExp(r'content\.(\w+)\.json').firstMatch(f.uri.pathSegments.last);
         if (m != null) {
           final lang = m.group(1)!;
-          final data = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+          final data =
+              jsonDecode(await f.readAsString()) as Map<String, dynamic>;
           _contentMap[lang] = data.cast<String, String>();
           print('   Loaded lang: $lang (${data.length} keys)');
         }
       }
     }
   }
-  print('   ${_videoDurations.length} durations, ${_videoLanguages.length} video-lang mappings');
+  print(
+      '   ${_videoDurations.length} durations, ${_videoLanguages.length} video-lang mappings');
 }
 
 // ─── GET /api/catalog_version ───
@@ -140,7 +147,8 @@ Map<String, dynamic> _buildCatalog(String mode, String reqLang) {
       final fid = '$mode/$cat/$id';
       final tKey = '${mode}_${cat}_${id}_title';
       final dKey = '${mode}_${cat}_${id}_desc';
-      final vLang = _resolveVideoLang(fid, reqLang);
+      final preferredAudioLang = _resolveAudioLang(fid, reqLang);
+      final availableAudioLangs = _getAvailableAudioLangs(fid);
 
       videos.add({
         'id': id,
@@ -148,9 +156,11 @@ Map<String, dynamic> _buildCatalog(String mode, String reqLang) {
         'title': _resolveText(tKey, langResolved),
         'description': _resolveText(dKey, langResolved),
         'duration_sec': _videoDurations[fid] ?? 60,
-        'video_url': '$_cdnBaseUrl/videos/$fid/$vLang.mp4',
-        'thumbnail_url': '$_cdnBaseUrl/videos/$fid/thumb.jpg',
-        'video_lang_resolved': vLang,
+        'stream_url': '$_cdnBaseUrl/videos/$fid/master.m3u8',
+        'thumbnail_url': '$_cdnBaseUrl/videos/$fid/thumb.webp',
+        'preferred_audio_lang': preferredAudioLang,
+        'available_audio_langs': availableAudioLangs,
+        'video_lang_resolved': preferredAudioLang,
         'active': true,
       });
     }
@@ -167,14 +177,22 @@ Map<String, dynamic> _buildCatalog(String mode, String reqLang) {
 }
 
 String _resolveText(String key, String lang) {
-  if (_contentMap[lang]?.containsKey(key) == true) return _contentMap[lang]![key]!;
-  if (_contentMap['en']?.containsKey(key) == true) return _contentMap['en']![key]!;
+  if (_contentMap[lang]?.containsKey(key) == true) {
+    return _contentMap[lang]![key]!;
+  }
+  if (_contentMap['en']?.containsKey(key) == true) {
+    return _contentMap['en']![key]!;
+  }
   return key;
 }
 
-String _resolveVideoLang(String fullId, String reqLang) {
+String _resolveAudioLang(String fullId, String reqLang) {
   final avail = _videoLanguages[fullId] ?? ['en'];
   if (avail.contains(reqLang)) return reqLang;
   if (avail.contains('hi')) return 'hi';
   return 'en';
+}
+
+List<String> _getAvailableAudioLangs(String fullId) {
+  return _videoLanguages[fullId] ?? ['en'];
 }

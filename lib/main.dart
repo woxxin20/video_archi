@@ -8,16 +8,13 @@ void main() async {
   // For Android emulator: 'http://10.0.2.2:8080'
   // For iOS simulator: 'http://localhost:8080'
   // For physical device: 'http://<your-ip>:8080'
-  VirtualHelpConfig.serverBaseUrl = 'http://10.0.2.2:8080';
+  VirtualHelpConfig.serverBaseUrl = 'http://localhost:8080';
+  // VirtualHelpConfig.serverBaseUrl = 'http://10.0.2.2:8080';
 
   // Initialize database
   await VirtualHelp.ensureInitialized();
 
-  runApp(
-    VirtualHelp.wrapWithProviders(
-      child: const MyApp(),
-    ),
-  );
+  runApp(VirtualHelp.wrapWithProviders(child: const MyApp()));
 }
 
 class MyApp extends StatelessWidget {

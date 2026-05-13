@@ -14,11 +14,10 @@
 ///   runApp(VirtualHelp.wrapWithProviders(child: YourApp()));
 /// }
 /// ```
-
+library;
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-
 
 import 'database/database_service.dart';
 import 'providers/virtual_help_provider.dart';
