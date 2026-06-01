@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
+import 'package:shelf_static/shelf_static.dart';
 
 // ─── Global State ───
 late Map<String, dynamic> _videosConfig;
@@ -11,26 +12,103 @@ late Map<String, Map<String, String>> _contentMap;
 late Map<String, int> _videoDurations;
 late Map<String, List<String>> _videoLanguages;
 late String _catalogVersion;
-String _cdnBaseUrl = 'http://192.168.1.104';
+/// Default CDN base URL — the public host that serves /videos/<mode>/<cat>/<id>/master.m3u8 etc.
+/// Override at runtime via `dart run bin/server.dart <cdn_base_url>` or the CDN_BASE_URL env var.
+String _cdnBaseUrl = 'http://192.168.1.57';
 final Map<String, Map<String, dynamic>> _catalogCache = {};
 
 void main(List<String> args) async {
   final port = int.tryParse(Platform.environment['PORT'] ?? '') ?? 8080;
-  if (args.isNotEmpty) _cdnBaseUrl = args[0];
 
-  await _loadConfigs();
+  // Resolve server root: script is at server/bin/server.dart
+  final scriptDir = File(Platform.script.toFilePath()).parent.path;
+  final root = Directory(scriptDir).parent.path;
+
+  // CDN base URL resolution priority: CLI arg > env var > default (http://192.168.1.57)
+  final envCdn = Platform.environment['CDN_BASE_URL'];
+  if (args.isNotEmpty) {
+    _cdnBaseUrl = args[0];
+  } else if (envCdn != null && envCdn.isNotEmpty) {
+    _cdnBaseUrl = envCdn;
+  }
+  // Strip trailing slash for consistent URL construction
+  if (_cdnBaseUrl.endsWith('/')) {
+    _cdnBaseUrl = _cdnBaseUrl.substring(0, _cdnBaseUrl.length - 1);
+  }
+
+  await _loadConfigs(root);
 
   final router = Router();
   router.get('/api/catalog', _handleCatalog);
   router.get('/api/catalog_version', _handleCatalogVersion);
+  router.get('/health', (Request _) => Response.ok(
+        jsonEncode({
+          'status': 'ok',
+          'catalog_version': _catalogVersion,
+          'cdn_base_url': _cdnBaseUrl,
+          'langs_loaded': _contentMap.keys.toList()..sort(),
+        }),
+        headers: {'Content-Type': 'application/json'},
+      ));
+
+  // static file handler for videos
+  final videoPath = '$root/videos';
+  if (!await Directory(videoPath).exists()) {
+    await Directory(videoPath).create(recursive: true);
+    print('   Created missing videos directory: $videoPath');
+  }
+
+  final staticHandler = createStaticHandler(
+    videoPath,
+    defaultDocument: 'index.html',
+  );
+
+  final cascade = Cascade().add(router.call).add((Request request) async {
+    final path = request.url.path;
+    if (path.startsWith('videos/')) {
+      final response = await staticHandler(request.change(path: 'videos/'));
+
+      // Force correct MIME types for HLS files (per architecture §7)
+      if (response.statusCode == 200 || response.statusCode == 206) {
+        if (path.endsWith('.m3u8')) {
+          return response.change(headers: {
+            'Content-Type': 'application/vnd.apple.mpegurl',
+            'Cache-Control': 'public, max-age=60',
+          });
+        } else if (path.endsWith('.ts')) {
+          return response.change(headers: {
+            'Content-Type': 'video/mp2t',
+            'Cache-Control': 'public, max-age=31536000',
+          });
+        } else if (path.endsWith('.aac')) {
+          return response.change(headers: {
+            'Content-Type': 'audio/aac',
+            'Cache-Control': 'public, max-age=31536000',
+          });
+        } else if (path.endsWith('.webp')) {
+          return response.change(headers: {
+            'Content-Type': 'image/webp',
+            'Cache-Control': 'public, max-age=86400',
+          });
+        } else if (path.endsWith('.jpg') || path.endsWith('.jpeg')) {
+          return response.change(headers: {
+            'Content-Type': 'image/jpeg',
+            'Cache-Control': 'public, max-age=86400',
+          });
+        }
+      }
+      return response;
+    }
+    return Response.notFound('Not Found');
+  });
 
   final handler = const Pipeline()
       .addMiddleware(logRequests())
       .addMiddleware(_cors())
-      .addHandler(router.call);
+      .addHandler(cascade.handler);
 
   final server = await shelf_io.serve(handler, InternetAddress.anyIPv4, port);
-  print('✅ Server running on http://localhost:${server.port}');
+  print('✅ Server running on http://${server.address.address}:${server.port}');
   print('   CDN: $_cdnBaseUrl | Version: $_catalogVersion');
 }
 
@@ -49,12 +127,7 @@ const _ch = {
 };
 
 // ─── Load Configs ───
-Future<void> _loadConfigs() async {
-  // Resolve server root: script is at server/bin/server.dart
-  // Go up from bin/ to server/
-  final scriptDir = File(Platform.script.toFilePath()).parent.path;
-  final root = Directory(scriptDir).parent.path;
-
+Future<void> _loadConfigs(String root) async {
   _videosConfig = jsonDecode(await File('$root/videos.json').readAsString());
   _catalogVersion = _videosConfig['catalog_version'] as String;
 
@@ -157,7 +230,7 @@ Map<String, dynamic> _buildCatalog(String mode, String reqLang) {
         'description': _resolveText(dKey, langResolved),
         'duration_sec': _videoDurations[fid] ?? 60,
         'stream_url': '$_cdnBaseUrl/videos/$fid/master.m3u8',
-        'thumbnail_url': '$_cdnBaseUrl/videos/$fid/thumb.webp',
+        'thumbnail_url': '$_cdnBaseUrl/videos/$fid/Thumbnail.webp',
         'preferred_audio_lang': preferredAudioLang,
         'available_audio_langs': availableAudioLangs,
         'video_lang_resolved': preferredAudioLang,

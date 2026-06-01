@@ -2,8 +2,10 @@
 /// Change [serverBaseUrl] before initializing in your app.
 class VirtualHelpConfig {
   /// Base URL of the catalog server (no trailing slash).
-  /// Example: 'http://10.0.2.2:8080' for Android emulator localhost.
-  static String serverBaseUrl = 'http://10.0.2.2:8080';
+  /// The server returns `stream_url`/`thumbnail_url` already pointed at the CDN
+  /// (configured server-side), so this only governs API endpoints.
+  /// Defaults to the LAN host where the production server runs (CDN: http://192.168.1.57/videos/).
+  static String serverBaseUrl = 'http://192.168.1.57:8080';
 
   /// A video is "watched" once this fraction of its duration has been played.
   static const double watchThreshold = 0.70;

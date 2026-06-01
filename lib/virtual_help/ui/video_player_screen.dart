@@ -171,7 +171,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   void _onPlayerEvent(BetterPlayerEvent event) {
     switch (event.betterPlayerEventType) {
       case BetterPlayerEventType.initialized:
-        log('[VideoPlayer] Initialized — using default audio track');
+        _selectPreferredAudioTrack();
         break;
       case BetterPlayerEventType.progress:
         _checkWatchProgress();
@@ -182,6 +182,55 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       default:
         break;
     }
+  }
+
+  /// Selects the HLS audio track matching `preferred_audio_lang` from the
+  /// catalog, with fallback chain per architecture §5.3:
+  /// requested → hi (regional) → en (guaranteed) → first available.
+  void _selectPreferredAudioTrack() {
+    final tracks = _controller.betterPlayerAsmsAudioTracks;
+    if (tracks == null || tracks.isEmpty) {
+      log('[VideoPlayer] No alternate audio tracks available on stream');
+      return;
+    }
+
+    final preferred = _currentVideo.preferredAudioLang.toLowerCase();
+
+    BetterPlayerAsmsAudioTrack? match;
+    String? matchReason;
+
+    // 1. Exact preferred language match
+    match = _firstWhereLang(tracks, preferred);
+    if (match != null) matchReason = 'preferred ($preferred)';
+
+    // 2. Regional fallback — Hindi for sub-continent locales
+    if (match == null) {
+      match = _firstWhereLang(tracks, 'hi');
+      if (match != null) matchReason = 'regional fallback (hi)';
+    }
+
+    // 3. English — always guaranteed by server
+    if (match == null) {
+      match = _firstWhereLang(tracks, 'en');
+      if (match != null) matchReason = 'final fallback (en)';
+    }
+
+    // 4. First track — last resort
+    match ??= tracks.first;
+    matchReason ??= 'first available (${match.language ?? '?'})';
+
+    log('[VideoPlayer] Audio track selected: $matchReason');
+    _controller.setAudioTrack(match);
+  }
+
+  BetterPlayerAsmsAudioTrack? _firstWhereLang(
+    List<BetterPlayerAsmsAudioTrack> tracks,
+    String lang,
+  ) {
+    for (final t in tracks) {
+      if ((t.language ?? '').toLowerCase() == lang) return t;
+    }
+    return null;
   }
 
   void _checkWatchProgress() {

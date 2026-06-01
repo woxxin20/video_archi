@@ -4,12 +4,13 @@ import 'virtual_help/virtual_help.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Configure server URL (change this to your production server)
-  // For Android emulator: 'http://10.0.2.2:8080'
-  // For iOS simulator: 'http://localhost:8080'
-  // For physical device: 'http://<your-ip>:8080'
-  VirtualHelpConfig.serverBaseUrl = 'http://localhost:8080';
-  // VirtualHelpConfig.serverBaseUrl = 'http://10.0.2.2:8080';
+  // Production server (LAN host running the Dart catalog server).
+  // CDN (videos / HLS segments) is hosted separately at http://192.168.1.57/videos/.
+  // Override per environment:
+  //   const String.fromEnvironment('VH_SERVER_URL') → --dart-define=VH_SERVER_URL=...
+  const overrideUrl = String.fromEnvironment('VH_SERVER_URL');
+  VirtualHelpConfig.serverBaseUrl =
+      overrideUrl.isNotEmpty ? overrideUrl : 'http://192.168.1.57:8080';
 
   // Initialize database
   await VirtualHelp.ensureInitialized();
