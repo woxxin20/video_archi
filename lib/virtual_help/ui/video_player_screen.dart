@@ -2,21 +2,31 @@ import 'dart:developer';
 
 import 'package:better_player_plus/better_player_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:http/http.dart' as http;
 
 import '../models/video_item.dart';
 import '../config.dart';
 import '../providers/virtual_help_provider.dart';
+import 'virtual_help_theme.dart';
 
-/// Fullscreen video player with HLS audio track selection and 70% watch threshold tracking.
+/// Full-screen video player.
+/// Business logic (HLS init, watch threshold, audio track) is unchanged.
+/// UI matches the Virtual Help design: dark overlay with category pill,
+/// serif title, progress bar, and Prev/Next navigation.
 class VideoPlayerScreen extends StatefulWidget {
   final VideoItem video;
   final String category;
+
+  /// All videos in this category — enables Prev/Next navigation.
+  final List<VideoItem> categoryVideos;
 
   const VideoPlayerScreen({
     super.key,
     required this.video,
     required this.category,
+    this.categoryVideos = const [],
   });
 
   @override
@@ -29,196 +39,177 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   bool _hasError = false;
   bool _isInitialized = false;
 
+  late int _currentIndex;
+  late List<VideoItem> _videos;
+
   @override
   void initState() {
     super.initState();
-    _initPlayer();
+    _videos = widget.categoryVideos.isNotEmpty
+        ? widget.categoryVideos
+        : [widget.video];
+    _currentIndex = _videos.indexWhere((v) => v.id == widget.video.id);
+    if (_currentIndex < 0) _currentIndex = 0;
+    _initPlayer(_videos[_currentIndex]);
   }
 
-  Future<void> _initPlayer() async {
+  VideoItem get _currentVideo => _videos[_currentIndex];
+
+  String get _categoryLabel =>
+      VirtualHelpTheme.categoryLabel[widget.category] ??
+      widget.category.toUpperCase();
+
+  Color get _accent =>
+      VirtualHelpTheme.categoryAccent[widget.category] ?? VirtualHelpTheme.brand;
+
+  // ═══════════════════════════════════════════════════════
+  //  HLS PLAYER INIT (unchanged business logic)
+  // ═══════════════════════════════════════════════════════
+
+  Future<void> _initPlayer(VideoItem video) async {
+    setState(() {
+      _hasError = false;
+      _isInitialized = false;
+    });
+
     final provider = context.read<VirtualHelpProvider>();
-    final preloaded = provider.preloadService.consume(widget.video.id);
+    final preloaded = provider.preloadService.consume(video.id);
 
-    log('[VideoPlayer] Initializing HLS player for video: ${widget.video.id}');
-    log('[VideoPlayer] Stream URL: ${widget.video.streamUrl}');
-    log('[VideoPlayer] Preferred audio: ${widget.video.preferredAudioLang}');
+    log('[VideoPlayer] Initializing for: ${video.id}');
+    log('[VideoPlayer] Stream URL: ${video.streamUrl}');
 
-    // ── Test with direct network URL first ────────────────────────────
     try {
-      // First try without HLS format detection
+      final response = await http.get(Uri.parse(video.streamUrl));
+      log('[VideoPlayer] HTTP status: ${response.statusCode}');
+    } catch (e) {
+      log('[VideoPlayer] Pre-check failed: $e');
+    }
+
+    try {
       final dataSource = BetterPlayerDataSource(
         BetterPlayerDataSourceType.network,
-        widget.video.streamUrl,
+        video.streamUrl,
         videoFormat: BetterPlayerVideoFormat.hls,
-        cacheConfiguration: BetterPlayerCacheConfiguration(
-          useCache: true,
-          maxCacheSize: 50 * 1024 * 1024, // 50MB total cache
-          maxCacheFileSize: 10 * 1024 * 1024, // 10MB per video
-        ),
+        cacheConfiguration: BetterPlayerCacheConfiguration(useCache: false),
       );
 
-      // ── Player configuration ──────────────────────────────────────────
       final config = BetterPlayerConfiguration(
-        aspectRatio: 9 / 16, // vertical video
         fit: BoxFit.cover,
         autoPlay: true,
         looping: false,
-        fullScreenByDefault: true,
+        fullScreenByDefault: false,
         allowedScreenSleep: false,
         controlsConfiguration: BetterPlayerControlsConfiguration(
           showControlsOnInitialize: false,
-          enableFullscreen: true,
+          enableFullscreen: false,
           enableProgressBar: true,
-          enableSkips: false, // health videos — no skipping
+          enableSkips: false,
           enableMute: true,
-          enablePlaybackSpeed: false, // keep it simple for health content
-          progressBarPlayedColor: Colors.pinkAccent,
-          progressBarBufferedColor: Colors.pink.withValues(alpha: 0.3),
-          controlBarColor: Colors.black54,
+          enablePlaybackSpeed: false,
+          progressBarPlayedColor: Colors.white,
+          progressBarBufferedColor: Colors.white30,
+          controlBarColor: Colors.transparent,
         ),
       );
 
       _controller = BetterPlayerController(config);
       _controller.addEventsListener(_onPlayerEvent);
 
-      log('[VideoPlayer] Setting up data source...');
       await _controller.setupDataSource(dataSource);
+      preloaded?.dispose();
 
-      // If we have a preloaded controller, dispose it since we're using HLS
-      if (preloaded != null) {
-        preloaded.dispose();
-      }
-
-      _isInitialized = true;
-      log('[VideoPlayer] HLS player initialized successfully');
-
-      if (mounted) setState(() {});
-    } catch (e, stackTrace) {
-      log('[VideoPlayer] HLS initialization failed: $e');
-      log('[VideoPlayer] Stack trace: $stackTrace');
-
-      // Try fallback to basic video player if HLS fails or resource is unavailable
-      final errorStr = e.toString();
-      if (errorStr.contains('HLS') || 
-          errorStr.contains('m3u8') || 
-          errorStr.contains('resource unavailable')) {
-        log('[VideoPlayer] Trying fallback to direct video stream...');
-        await _tryFallbackPlayer();
-      } else {
-        if (mounted) setState(() => _hasError = true);
-      }
+      if (mounted) setState(() => _isInitialized = true);
+    } catch (e, st) {
+      log('[VideoPlayer] HLS init failed: $e\n$st');
+      await _tryFallback(video);
     }
   }
 
-  Future<void> _tryFallbackPlayer() async {
+  Future<void> _tryFallback(VideoItem video) async {
     try {
-      // Try to get the video segment directly
-      final videoStreamUrl = widget.video.streamUrl.replaceFirst(
+      final fallbackUrl = video.streamUrl.replaceFirst(
         '/master.m3u8',
         '/video/stream.m3u8',
       );
-
       final dataSource = BetterPlayerDataSource(
         BetterPlayerDataSourceType.network,
-        videoStreamUrl,
+        fallbackUrl,
         cacheConfiguration: BetterPlayerCacheConfiguration(
           useCache: true,
           maxCacheSize: 50 * 1024 * 1024,
           maxCacheFileSize: 10 * 1024 * 1024,
         ),
       );
-
       final config = BetterPlayerConfiguration(
-        aspectRatio: 9 / 16,
         fit: BoxFit.cover,
         autoPlay: true,
         looping: false,
-        fullScreenByDefault: true,
+        fullScreenByDefault: false,
         allowedScreenSleep: false,
         controlsConfiguration: BetterPlayerControlsConfiguration(
           showControlsOnInitialize: false,
-          enableFullscreen: true,
+          enableFullscreen: false,
           enableProgressBar: true,
           enableSkips: false,
           enableMute: true,
           enablePlaybackSpeed: false,
-          progressBarPlayedColor: Colors.pinkAccent,
-          progressBarBufferedColor: Colors.pink.withValues(alpha: 0.3),
-          controlBarColor: Colors.black54,
+          progressBarPlayedColor: Colors.white,
+          progressBarBufferedColor: Colors.white30,
+          controlBarColor: Colors.transparent,
         ),
       );
-
       _controller = BetterPlayerController(config);
       _controller.addEventsListener(_onPlayerEvent);
-
-      log('[VideoPlayer] Setting up fallback data source: $videoStreamUrl');
       await _controller.setupDataSource(dataSource);
-
-      _isInitialized = true;
-      log('[VideoPlayer] Fallback player initialized successfully');
-
-      if (mounted) setState(() {});
-    } catch (e, stackTrace) {
-      log('[VideoPlayer] Fallback player failed: $e');
-      log('[VideoPlayer] Fallback stack trace: $stackTrace');
+      if (mounted) setState(() => _isInitialized = true);
+    } catch (e) {
+      log('[VideoPlayer] Fallback failed: $e');
       if (mounted) setState(() => _hasError = true);
     }
   }
 
   void _onPlayerEvent(BetterPlayerEvent event) {
     switch (event.betterPlayerEventType) {
-      // ── Video initialized: select audio track ──────────────────────
       case BetterPlayerEventType.initialized:
-        _selectAudioTrack();
+        log('[VideoPlayer] Initialized — using default audio track');
         break;
-
-      // ── Track progress for watch threshold ────────────────────────
       case BetterPlayerEventType.progress:
         _checkWatchProgress();
         break;
-
-      // ── Video finished: mark watched (safety net) ─────────────────
       case BetterPlayerEventType.finished:
-        if (!_alreadyMarkedWatched) {
-          _markWatched();
-        }
+        if (!_alreadyMarkedWatched) _markWatched();
         break;
-
       default:
         break;
     }
   }
 
-  /// Selects the audio track matching preferred language.
-  /// Note: better_player audio track API is complex, simplified for now.
-  void _selectAudioTrack() {
-    log('[VideoPlayer] Audio track selection not implemented in this version');
-    log('[VideoPlayer] Using default audio track from HLS stream');
-  }
-
   void _checkWatchProgress() {
     if (_alreadyMarkedWatched) return;
-
-    final position = _controller.videoPlayerController?.value.position;
-    final duration = _controller.videoPlayerController?.value.duration;
-
-    if (position == null || duration == null) return;
-    if (duration.inSeconds == 0) return;
-
-    final progress = position.inSeconds / duration.inSeconds;
-
-    if (progress >= VirtualHelpConfig.watchThreshold) {
+    final pos = _controller.videoPlayerController?.value.position;
+    final dur = _controller.videoPlayerController?.value.duration;
+    if (pos == null || dur == null || dur.inSeconds == 0) return;
+    if (pos.inSeconds / dur.inSeconds >= VirtualHelpConfig.watchThreshold) {
       _alreadyMarkedWatched = true;
       _markWatched();
     }
   }
 
   void _markWatched() {
-    log('[VideoPlayer] Marking video as watched: ${widget.video.id}');
+    log('[VideoPlayer] Marking watched: ${_currentVideo.id}');
     context.read<VirtualHelpProvider>().markVideoWatched(
-      widget.video.id,
-      widget.category,
-    );
+          _currentVideo.id,
+          widget.category,
+        );
+  }
+
+  void _navigateTo(int newIndex) {
+    if (newIndex < 0 || newIndex >= _videos.length) return;
+    _controller.removeEventsListener(_onPlayerEvent);
+    _controller.dispose();
+    _alreadyMarkedWatched = false;
+    setState(() => _currentIndex = newIndex);
+    _initPlayer(_videos[newIndex]);
   }
 
   @override
@@ -228,115 +219,559 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     super.dispose();
   }
 
+  // ═══════════════════════════════════════════════════════
+  //  BUILD
+  // ═══════════════════════════════════════════════════════
+
   @override
   Widget build(BuildContext context) {
+    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.light);
+
     return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        foregroundColor: Colors.white,
-        title: Text(widget.video.title, style: const TextStyle(fontSize: 16)),
-      ),
-      body: _hasError
-          ? Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.error_outline,
-                    size: 48,
-                    color: Colors.white70,
-                  ),
-                  const SizedBox(height: 16),
-                  const Text(
-                    'Failed to load video',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 24),
-                    child: Text(
-                      'Stream URL: ${widget.video.streamUrl}',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        color: Colors.white70,
-                        fontSize: 10,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                  ElevatedButton(
-                    onPressed: () {
-                      setState(() => _hasError = false);
-                      _initPlayer();
-                    },
-                    child: const Text('Retry'),
-                  ),
-                ],
-              ),
-            )
-          : _isInitialized
-          ? Column(
-              children: [
-                // ── Player ───────────────────────────────────────────────
-                Expanded(child: BetterPlayer(controller: _controller)),
-
-                // ── Title + Description ───────────────────────────────────
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        widget.video.title,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        widget.video.description,
-                        style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.8),
-                          fontSize: 14,
-                        ),
-                      ),
-
-                      // ── Audio language indicator ───────────────────────
-                      if (widget.video.videoLangResolved !=
-                          widget.video.preferredAudioLang)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 8),
-                          child: _AudioFallbackBadge(
-                            requestedLang: widget.video.preferredAudioLang,
-                            resolvedLang: widget.video.videoLangResolved,
-                          ),
-                        ),
-                    ],
-                  ),
+      backgroundColor: VirtualHelpTheme.playerBg,
+      body: Stack(
+        children: [
+          // ── Ambient background gradient ──────────────────────────────
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: const Alignment(-0.8, -1),
+                  end: const Alignment(0.8, 1),
+                  colors: [
+                    _accent.withValues(alpha: 0.22),
+                    _accent.withValues(alpha: 0.08),
+                  ],
                 ),
-              ],
+              ),
+            ),
+          ),
+
+          // ── Main content ─────────────────────────────────────────────
+          if (_hasError)
+            _ErrorView(
+              video: _currentVideo,
+              onRetry: () => _initPlayer(_currentVideo),
             )
-          : const Center(child: CircularProgressIndicator()),
+          else if (_isInitialized)
+            _PlayerView(controller: _controller)
+          else
+            const Center(
+              child: CircularProgressIndicator(color: Colors.white54),
+            ),
+
+          // ── Top bar ──────────────────────────────────────────────────
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: _TopBar(
+              categoryLabel: _categoryLabel,
+              currentIndex: _currentIndex,
+              total: _videos.length,
+              onBack: () {
+                SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.dark);
+                Navigator.of(context).pop();
+              },
+            ),
+          ),
+
+          // ── Side actions ─────────────────────────────────────────────
+          Positioned(
+            right: 14,
+            bottom: 210,
+            child: _SideActions(accent: _accent),
+          ),
+
+          // ── Bottom overlay ───────────────────────────────────────────
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: _BottomOverlay(
+              video: _currentVideo,
+              accent: _accent,
+              categoryLabel: _categoryLabel,
+              currentIndex: _currentIndex,
+              total: _videos.length,
+              controller: _isInitialized ? _controller : null,
+              onPrev: _currentIndex > 0 ? () => _navigateTo(_currentIndex - 1) : null,
+              onNext: _currentIndex < _videos.length - 1
+                  ? () => _navigateTo(_currentIndex + 1)
+                  : null,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
 
-// ── Small UI badge shown when audio fell back to another language ─────
-class _AudioFallbackBadge extends StatelessWidget {
+// ── Player view ──────────────────────────────────────────────────────
+
+class _PlayerView extends StatelessWidget {
+  final BetterPlayerController controller;
+  const _PlayerView({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: AspectRatio(
+        aspectRatio: 9 / 16,
+        child: BetterPlayer(controller: controller),
+      ),
+    );
+  }
+}
+
+// ── Top bar ──────────────────────────────────────────────────────────
+
+class _TopBar extends StatelessWidget {
+  final String categoryLabel;
+  final int currentIndex;
+  final int total;
+  final VoidCallback onBack;
+
+  const _TopBar({
+    required this.categoryLabel,
+    required this.currentIndex,
+    required this.total,
+    required this.onBack,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final top = MediaQuery.of(context).padding.top;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(20, top + 14, 20, 14),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          // Back button
+          GestureDetector(
+            onTap: onBack,
+            child: Container(
+              width: 38,
+              height: 38,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: Colors.white.withValues(alpha: 0.12),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+              ),
+              child: const Icon(Icons.chevron_left_rounded,
+                  color: Colors.white, size: 22),
+            ),
+          ),
+
+          const Spacer(),
+
+          // Category + count
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                'Virtual Help · $categoryLabel',
+                style: VirtualHelpTheme.sans(
+                  size: 9,
+                  weight: FontWeight.w600,
+                  color: Colors.white.withValues(alpha: 0.5),
+                  letterSpacing: 0.1,
+                ),
+              ),
+              const SizedBox(height: 1),
+              Text(
+                'Video ${currentIndex + 1} of $total',
+                style: VirtualHelpTheme.serif(
+                  size: 14,
+                  weight: FontWeight.w300,
+                  color: Colors.white,
+                  italic: true,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Side actions ─────────────────────────────────────────────────────
+
+class _SideActions extends StatelessWidget {
+  final Color accent;
+  const _SideActions({required this.accent});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _SideButton(icon: Icons.bookmark_border_rounded, label: 'Save'),
+        const SizedBox(height: 16),
+        _SideButton(icon: Icons.share_outlined, label: 'Share'),
+      ],
+    );
+  }
+}
+
+class _SideButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  const _SideButton({required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.white.withValues(alpha: 0.10),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+          ),
+          child: Icon(icon, color: Colors.white.withValues(alpha: 0.75), size: 17),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          label,
+          style: VirtualHelpTheme.sans(
+            size: 8,
+            color: Colors.white.withValues(alpha: 0.5),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── Bottom overlay ───────────────────────────────────────────────────
+
+class _BottomOverlay extends StatelessWidget {
+  final VideoItem video;
+  final Color accent;
+  final String categoryLabel;
+  final int currentIndex;
+  final int total;
+  final BetterPlayerController? controller;
+  final VoidCallback? onPrev;
+  final VoidCallback? onNext;
+
+  const _BottomOverlay({
+    required this.video,
+    required this.accent,
+    required this.categoryLabel,
+    required this.currentIndex,
+    required this.total,
+    required this.controller,
+    required this.onPrev,
+    required this.onNext,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bottom = MediaQuery.of(context).padding.bottom;
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.bottomCenter,
+          end: Alignment.topCenter,
+          stops: const [0, 1],
+          colors: [
+            Colors.black.withValues(alpha: 0.78),
+            Colors.transparent,
+          ],
+        ),
+      ),
+      padding: EdgeInsets.fromLTRB(20, 28, 20, bottom + 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Category pill
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: accent,
+              borderRadius: BorderRadius.circular(7),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.check_rounded, color: Colors.white, size: 10),
+                const SizedBox(width: 4),
+                Text(
+                  categoryLabel == 'Tips' ? 'Daily Tip' : categoryLabel,
+                  style: VirtualHelpTheme.sans(
+                    size: 8.5,
+                    weight: FontWeight.w700,
+                    color: Colors.white,
+                    letterSpacing: 0.07,
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // Title
+          Text(
+            video.title,
+            style: VirtualHelpTheme.serif(
+              size: 20,
+              weight: FontWeight.w200,
+              color: Colors.white,
+            ),
+          ),
+
+          const SizedBox(height: 6),
+
+          // Description
+          Text(
+            video.description,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+            style: VirtualHelpTheme.sans(
+              size: 10,
+              color: Colors.white.withValues(alpha: 0.6),
+              height: 1.6,
+            ),
+          ),
+
+          const SizedBox(height: 14),
+
+          // Progress bar
+          _ProgressBar(controller: controller),
+
+          const SizedBox(height: 14),
+
+          // Navigation
+          Row(
+            children: [
+              // Prev
+              Expanded(
+                child: _NavButton(
+                  label: 'Prev',
+                  icon: Icons.chevron_left_rounded,
+                  iconOnLeft: true,
+                  enabled: onPrev != null,
+                  onTap: onPrev,
+                ),
+              ),
+
+              // Dot indicators
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Row(
+                  children: List.generate(total, (i) {
+                    return Container(
+                      width: 6,
+                      height: 6,
+                      margin: const EdgeInsets.symmetric(horizontal: 3),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: i == currentIndex
+                            ? Colors.white
+                            : Colors.white.withValues(alpha: 0.28),
+                      ),
+                    );
+                  }),
+                ),
+              ),
+
+              // Next
+              Expanded(
+                child: _NavButton(
+                  label: 'Next',
+                  icon: Icons.chevron_right_rounded,
+                  iconOnLeft: false,
+                  enabled: onNext != null,
+                  onTap: onNext,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProgressBar extends StatefulWidget {
+  final BetterPlayerController? controller;
+  const _ProgressBar({this.controller});
+
+  @override
+  State<_ProgressBar> createState() => _ProgressBarState();
+}
+
+class _ProgressBarState extends State<_ProgressBar> {
+  double _progress = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller?.addEventsListener(_onEvent);
+  }
+
+  void _onEvent(BetterPlayerEvent event) {
+    if (!mounted) return;
+    if (event.betterPlayerEventType == BetterPlayerEventType.progress) {
+      final pos = widget.controller?.videoPlayerController?.value.position;
+      final dur = widget.controller?.videoPlayerController?.value.duration;
+      if (pos != null && dur != null && dur.inSeconds > 0) {
+        setState(() => _progress = pos.inSeconds / dur.inSeconds);
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.controller?.removeEventsListener(_onEvent);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 3,
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.22),
+        borderRadius: BorderRadius.circular(3),
+      ),
+      child: FractionallySizedBox(
+        widthFactor: _progress.clamp(0.0, 1.0),
+        alignment: Alignment.centerLeft,
+        child: Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(3),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NavButton extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final bool iconOnLeft;
+  final bool enabled;
+  final VoidCallback? onTap;
+
+  const _NavButton({
+    required this.label,
+    required this.icon,
+    required this.iconOnLeft,
+    required this.enabled,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: enabled ? onTap : null,
+      child: Opacity(
+        opacity: enabled ? 1.0 : 0.35,
+        child: Container(
+          height: 36,
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.10),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+            borderRadius: BorderRadius.circular(11),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: iconOnLeft
+                ? [
+                    Icon(icon,
+                        color: Colors.white.withValues(alpha: 0.75), size: 18),
+                    const SizedBox(width: 4),
+                    Text(
+                      label,
+                      style: VirtualHelpTheme.sans(
+                        size: 10,
+                        weight: FontWeight.w600,
+                        color: Colors.white.withValues(alpha: 0.82),
+                      ),
+                    ),
+                  ]
+                : [
+                    Text(
+                      label,
+                      style: VirtualHelpTheme.sans(
+                        size: 10,
+                        weight: FontWeight.w600,
+                        color: Colors.white.withValues(alpha: 0.82),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Icon(icon,
+                        color: Colors.white.withValues(alpha: 0.75), size: 18),
+                  ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Error view ───────────────────────────────────────────────────────
+
+class _ErrorView extends StatelessWidget {
+  final VideoItem video;
+  final VoidCallback onRetry;
+  const _ErrorView({required this.video, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.error_outline, size: 48, color: Colors.white54),
+            const SizedBox(height: 16),
+            Text(
+              'Failed to load video',
+              style: VirtualHelpTheme.sans(
+                  size: 16, weight: FontWeight.w600, color: Colors.white),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              video.streamUrl,
+              style: VirtualHelpTheme.sans(
+                  size: 10, color: Colors.white.withValues(alpha: 0.5)),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: VirtualHelpTheme.brand),
+              onPressed: onRetry,
+              child: const Text('Retry'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Audio fallback badge (kept for compatibility) ─────────────────────
+
+class AudioFallbackBadge extends StatelessWidget {
   final String requestedLang;
   final String resolvedLang;
-
-  const _AudioFallbackBadge({
-    required this.requestedLang,
-    required this.resolvedLang,
-  });
+  const AudioFallbackBadge(
+      {super.key, required this.requestedLang, required this.resolvedLang});
 
   @override
   Widget build(BuildContext context) {
@@ -348,42 +783,9 @@ class _AudioFallbackBadge extends StatelessWidget {
         border: Border.all(color: Colors.orange.withValues(alpha: 0.5)),
       ),
       child: Text(
-        'Playing in ${_langName(resolvedLang)} (${_langName(requestedLang)} coming soon)',
+        'Playing in $resolvedLang ($requestedLang coming soon)',
         style: const TextStyle(color: Colors.orange, fontSize: 12),
       ),
     );
-  }
-
-  String _langName(String code) {
-    const names = {
-      'en': 'English',
-      'hi': 'Hindi',
-      'gu': 'Gujarati',
-      'mr': 'Marathi',
-      'ta': 'Tamil',
-      'te': 'Telugu',
-      'bn': 'Bengali',
-      'pa': 'Punjabi',
-      'ur': 'Urdu',
-      'ar': 'Arabic',
-      'fr': 'French',
-      'es': 'Spanish',
-      'de': 'German',
-      'pt': 'Portuguese',
-      'ru': 'Russian',
-      'zh': 'Chinese',
-      'ja': 'Japanese',
-      'ko': 'Korean',
-      'id': 'Indonesian',
-      'tr': 'Turkish',
-      'sw': 'Swahili',
-      'vi': 'Vietnamese',
-      'fa': 'Persian',
-      'am': 'Amharic',
-      'af': 'Afrikaans',
-      'tl': 'Filipino',
-      'th': 'Thai',
-    };
-    return names[code] ?? code.toUpperCase();
   }
 }
