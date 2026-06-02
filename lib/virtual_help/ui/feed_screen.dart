@@ -40,12 +40,17 @@ class _FeedScreenState extends State<FeedScreen> {
         if (provider.isLoading) {
           return const Scaffold(
             backgroundColor: VirtualHelpTheme.bgWarm,
-            body: Center(child: CircularProgressIndicator(color: VirtualHelpTheme.brand)),
+            body: Center(
+              child: CircularProgressIndicator(color: VirtualHelpTheme.brand),
+            ),
           );
         }
 
         if (provider.currentCatalog == null) {
-          return OfflineWidget(onRetry: () => provider.retry());
+          return OfflineWidget(
+            onRetry: () => provider.retry(),
+            errorMessage: provider.errorMessage,
+          );
         }
 
         return Scaffold(
@@ -98,7 +103,9 @@ class _GreetingHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final modeLabel = provider.currentMode == 'pregnancy' ? 'Pregnancy' : 'Period';
+    final modeLabel = provider.currentMode == 'pregnancy'
+        ? 'Pregnancy'
+        : 'Period';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -171,10 +178,15 @@ class _HeroCard extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 3),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 11,
+                  vertical: 3,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.white.withValues(alpha: 0.22),
-                  border: Border.all(color: Colors.white.withValues(alpha: 0.3)),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.3),
+                  ),
                   borderRadius: BorderRadius.circular(20),
                 ),
                 child: Text(
@@ -224,7 +236,9 @@ class _HeroCard extends StatelessWidget {
                 height: 90,
                 decoration: BoxDecoration(
                   color: Colors.white.withValues(alpha: 0.12),
-                  border: Border.all(color: Colors.white.withValues(alpha: 0.22)),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.22),
+                  ),
                   borderRadius: BorderRadius.circular(15),
                 ),
                 child: Opacity(
@@ -310,11 +324,13 @@ class _VirtualHelpSection extends StatelessWidget {
     final serverCats = provider.currentCategories;
     return [
       _CategoryOption('all', 'All', Colors.transparent),
-      ...serverCats.map((cat) => _CategoryOption(
-            cat,
-            VirtualHelpTheme.categoryLabel[cat] ?? cat,
-            VirtualHelpTheme.categoryAccent[cat] ?? VirtualHelpTheme.brand,
-          )),
+      ...serverCats.map(
+        (cat) => _CategoryOption(
+          cat,
+          VirtualHelpTheme.categoryLabel[cat] ?? cat,
+          VirtualHelpTheme.categoryAccent[cat] ?? VirtualHelpTheme.brand,
+        ),
+      ),
     ];
   }
 
@@ -325,23 +341,27 @@ class _VirtualHelpSection extends StatelessWidget {
       for (final cat in provider.currentCategories) {
         final slots = provider.getFeedForCategory(cat);
         for (int i = 0; i < slots.length; i++) {
-          result.add(_SlottedVideo(
-            slot: slots[i],
-            category: cat,
-            isToday: i == 0 && !slots[i].isRewatch,
-            allInCategory: slots.map((s) => s.video).toList(),
-          ));
+          result.add(
+            _SlottedVideo(
+              slot: slots[i],
+              category: cat,
+              isToday: i == 0 && !slots[i].isRewatch,
+              allInCategory: slots.map((s) => s.video).toList(),
+            ),
+          );
         }
       }
     } else {
       final slots = provider.getFeedForCategory(selectedCategory);
       for (int i = 0; i < slots.length; i++) {
-        result.add(_SlottedVideo(
-          slot: slots[i],
-          category: selectedCategory,
-          isToday: i == 0 && !slots[i].isRewatch,
-          allInCategory: slots.map((s) => s.video).toList(),
-        ));
+        result.add(
+          _SlottedVideo(
+            slot: slots[i],
+            category: selectedCategory,
+            isToday: i == 0 && !slots[i].isRewatch,
+            allInCategory: slots.map((s) => s.video).toList(),
+          ),
+        );
       }
     }
 
@@ -388,7 +408,10 @@ class _VirtualHelpSection extends StatelessWidget {
                 ),
                 const SizedBox(width: 6),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
+                  ),
                   decoration: BoxDecoration(
                     color: VirtualHelpTheme.brand,
                     borderRadius: BorderRadius.circular(6),
@@ -446,7 +469,9 @@ class _VirtualHelpSection extends StatelessWidget {
                     duration: const Duration(milliseconds: 180),
                     curve: Curves.easeInOut,
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 15, vertical: 6),
+                      horizontal: 15,
+                      vertical: 6,
+                    ),
                     decoration: BoxDecoration(
                       color: isSelected
                           ? VirtualHelpTheme.brand
@@ -484,8 +509,7 @@ class _VirtualHelpSection extends StatelessWidget {
               padding: const EdgeInsets.symmetric(vertical: 24),
               child: Text(
                 'No videos available.',
-                style: VirtualHelpTheme.sans(
-                    color: VirtualHelpTheme.textMuted),
+                style: VirtualHelpTheme.sans(color: VirtualHelpTheme.textMuted),
               ),
             ),
           )
@@ -522,7 +546,9 @@ class _VirtualHelpSection extends StatelessWidget {
           final isCurrent = lang == provider.currentLang;
           return ListTile(
             title: Text(lang.toUpperCase()),
-            trailing: isCurrent ? const Icon(Icons.check, color: VirtualHelpTheme.brand) : null,
+            trailing: isCurrent
+                ? const Icon(Icons.check, color: VirtualHelpTheme.brand)
+                : null,
             onTap: () {
               provider.changeLanguage(lang);
               Navigator.pop(context);

@@ -68,8 +68,8 @@ class VirtualHelpProvider extends ChangeNotifier {
   VideoPreloadService get preloadService => _preloadService;
 
   VirtualHelpProvider({ApiService? api, DatabaseService? db})
-      : _api = api ?? ApiService(),
-        _db = db ?? DatabaseService.instance;
+    : _api = api ?? ApiService(),
+      _db = db ?? DatabaseService.instance;
 
   // ═══════════════════════════════════════════════════════
   //  INITIALIZATION (Section 14 — First Install + Subsequent Opens)
@@ -88,10 +88,14 @@ class VirtualHelpProvider extends ChangeNotifier {
 
       // 2. Load persisted preferences
       final prefs = await SharedPreferences.getInstance();
-      _currentMode = prefs.getString('vh_current_mode') ?? VirtualHelpConfig.defaultMode;
-      _currentLang = prefs.getString('vh_current_lang') ?? VirtualHelpConfig.defaultLang;
-      _catalogVersionPeriod = prefs.getString('vh_catalog_version_period') ?? '';
-      _catalogVersionPregnancy = prefs.getString('vh_catalog_version_pregnancy') ?? '';
+      _currentMode =
+          prefs.getString('vh_current_mode') ?? VirtualHelpConfig.defaultMode;
+      _currentLang =
+          prefs.getString('vh_current_lang') ?? VirtualHelpConfig.defaultLang;
+      _catalogVersionPeriod =
+          prefs.getString('vh_catalog_version_period') ?? '';
+      _catalogVersionPregnancy =
+          prefs.getString('vh_catalog_version_pregnancy') ?? '';
 
       // 3. Initialize database
       await _db.initialize();
@@ -124,8 +128,11 @@ class VirtualHelpProvider extends ChangeNotifier {
       _triggerPreload();
 
       // 9. If no catalog at all (first launch offline), show error
-      if (_catalogs[_currentMode] == null) {
-        _errorMessage = 'Connect to internet to load your content.';
+      //    (Preserve any specific error already set by _checkAndSyncCatalog.)
+      if (_catalogs[_currentMode] == null && _errorMessage == null) {
+        _errorMessage = _isOnline
+            ? 'Server unreachable at ${VirtualHelpConfig.serverBaseUrl}'
+            : 'Connect to internet to load your content.';
       }
 
       _isInitialized = true;
@@ -150,14 +157,44 @@ class VirtualHelpProvider extends ChangeNotifier {
 
   Future<void> _loadStoredCatalog(String mode) async {
     final json = await _db.loadCatalog(mode, _currentLang);
-    if (json != null) {
-      try {
-        _catalogs[mode] = CatalogResponse.fromJson(json);
-      } catch (e) {
-        // Corrupted catalog — delete and re-fetch (Section 22)
-        debugPrint('Corrupted catalog for $mode, deleting: $e');
-        await _db.deleteCatalog(mode, _currentLang);
+    if (json == null) return;
+    try {
+      final cached = CatalogResponse.fromJson(json);
+
+      // Schema-drift guard: if cached stream_urls don't point at the current
+      // server's /hls/ endpoint, drop the cache so we re-fetch and pick up
+      // the new format (this handles the v1 → /hls/ migration cleanly).
+      String? sampleStreamUrl;
+      for (final c in cached.categories.values) {
+        for (final v in c.videos) {
+          if (v.streamUrl.isNotEmpty) {
+            sampleStreamUrl = v.streamUrl;
+            break;
+          }
+        }
+        if (sampleStreamUrl != null) break;
       }
+      if (sampleStreamUrl != null && !sampleStreamUrl.contains('/hls/')) {
+        debugPrint(
+            '[Provider] Cached catalog uses legacy stream_url, invalidating');
+        await _db.deleteCatalog(mode, _currentLang);
+        // Also reset stored version so next sync re-fetches
+        final prefs = await SharedPreferences.getInstance();
+        if (mode == 'period') {
+          _catalogVersionPeriod = '';
+          await prefs.setString('vh_catalog_version_period', '');
+        } else {
+          _catalogVersionPregnancy = '';
+          await prefs.setString('vh_catalog_version_pregnancy', '');
+        }
+        return;
+      }
+
+      _catalogs[mode] = cached;
+    } catch (e) {
+      // Corrupted catalog — delete and re-fetch (Section 22)
+      debugPrint('Corrupted catalog for $mode, deleting: $e');
+      await _db.deleteCatalog(mode, _currentLang);
     }
   }
 
@@ -166,9 +203,16 @@ class VirtualHelpProvider extends ChangeNotifier {
         ? _catalogVersionPeriod
         : _catalogVersionPregnancy;
 
+    debugPrint(
+        '[Provider] Sync $mode (lang=$_currentLang) from ${VirtualHelpConfig.serverBaseUrl}');
+
     // Lightweight version check (Section 14)
-    final serverVersion = await _api.fetchCatalogVersion(mode);
-    if (serverVersion == null) return; // Network failed, use stored
+    final versionResult = await _api.fetchCatalogVersion(mode);
+    if (!versionResult.isOk) {
+      if (_catalogs[mode] == null) _errorMessage = versionResult.error;
+      return;
+    }
+    final serverVersion = versionResult.data!;
 
     if (storedVersion == serverVersion && _catalogs.containsKey(mode)) {
       // Same version, use cached — zero additional network call
@@ -176,11 +220,24 @@ class VirtualHelpProvider extends ChangeNotifier {
     }
 
     // Version changed or no catalog stored — fetch full catalog
-    final catalogJson = await _api.fetchCatalog(mode, _currentLang);
-    if (catalogJson == null) return; // Network failed
+    final catalogResult = await _api.fetchCatalog(mode, _currentLang);
+    if (!catalogResult.isOk) {
+      if (_catalogs[mode] == null) _errorMessage = catalogResult.error;
+      return;
+    }
+    final catalogJson = catalogResult.data!;
 
-    final catalog = CatalogResponse.fromJson(catalogJson);
+    final CatalogResponse catalog;
+    try {
+      catalog = CatalogResponse.fromJson(catalogJson);
+    } catch (e) {
+      _errorMessage = 'Catalog parse failed: $e';
+      debugPrint('[Provider] Catalog parse error: $e');
+      return;
+    }
     _catalogs[mode] = catalog;
+    debugPrint(
+        '[Provider] Catalog loaded: $mode/$_currentLang v${catalog.catalogVersion}');
 
     // Store in Isar
     await _db.storeCatalog(mode, _currentLang, catalogJson);
@@ -189,10 +246,16 @@ class VirtualHelpProvider extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     if (mode == 'period') {
       _catalogVersionPeriod = catalog.catalogVersion;
-      await prefs.setString('vh_catalog_version_period', catalog.catalogVersion);
+      await prefs.setString(
+        'vh_catalog_version_period',
+        catalog.catalogVersion,
+      );
     } else {
       _catalogVersionPregnancy = catalog.catalogVersion;
-      await prefs.setString('vh_catalog_version_pregnancy', catalog.catalogVersion);
+      await prefs.setString(
+        'vh_catalog_version_pregnancy',
+        catalog.catalogVersion,
+      );
     }
 
     // Sync new videos into queues (Section 17)

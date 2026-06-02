@@ -80,7 +80,9 @@ class VideoCardWidget extends StatelessWidget {
         child: Container(
           width: VirtualHelpTheme.cardWidth,
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(VirtualHelpTheme.cardBorderRadius),
+            borderRadius: BorderRadius.circular(
+              VirtualHelpTheme.cardBorderRadius,
+            ),
             boxShadow: const [
               BoxShadow(
                 color: Color(0x21784614),
@@ -237,31 +239,6 @@ class _Thumbnail extends StatelessWidget {
             ),
           ),
 
-          // Play button
-          Center(
-            child: Container(
-              width: 42,
-              height: 42,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: Colors.white.withValues(alpha: 0.92),
-                boxShadow: const [
-                  BoxShadow(
-                    color: Color(0x38000000),
-                    blurRadius: 12,
-                    offset: Offset(0, 2),
-                  ),
-                ],
-              ),
-              child: Center(
-                child: Padding(
-                  padding: const EdgeInsets.only(left: 3),
-                  child: Icon(Icons.play_arrow_rounded, color: accent, size: 24),
-                ),
-              ),
-            ),
-          ),
-
           // "Watch Now" strip (today only)
           if (isToday)
             Positioned(
@@ -270,7 +247,10 @@ class _Thumbnail extends StatelessWidget {
               right: 0,
               child: Center(
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 3,
+                  ),
                   decoration: BoxDecoration(
                     color: VirtualHelpTheme.brand.withValues(alpha: 0.88),
                     borderRadius: BorderRadius.circular(7),

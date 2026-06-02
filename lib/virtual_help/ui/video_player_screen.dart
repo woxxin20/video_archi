@@ -42,6 +42,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   late int _currentIndex;
   late List<VideoItem> _videos;
 
+  bool _isInitCalled = false;
+
   @override
   void initState() {
     super.initState();
@@ -50,7 +52,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         : [widget.video];
     _currentIndex = _videos.indexWhere((v) => v.id == widget.video.id);
     if (_currentIndex < 0) _currentIndex = 0;
-    _initPlayer(_videos[_currentIndex]);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_isInitCalled) {
+      _isInitCalled = true;
+      _initPlayer(_videos[_currentIndex]);
+    }
   }
 
   VideoItem get _currentVideo => _videos[_currentIndex];
@@ -67,6 +77,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   // ═══════════════════════════════════════════════════════
 
   Future<void> _initPlayer(VideoItem video) async {
+    // Capture screen size BEFORE any async gap (BuildContext rule).
+    final screen = MediaQuery.of(context).size;
+    final screenAspect = screen.width / screen.height;
+
     setState(() {
       _hasError = false;
       _isInitialized = false;
@@ -93,21 +107,25 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         cacheConfiguration: BetterPlayerCacheConfiguration(useCache: false),
       );
 
+      // Use the SCREEN's aspect ratio so BetterPlayer's internal AspectRatio
+      // widget matches the device exactly — combined with fit: cover this
+      // gives true full-screen reel behaviour on any phone.
       final config = BetterPlayerConfiguration(
+        aspectRatio: screenAspect,
         fit: BoxFit.cover,
         autoPlay: true,
         looping: false,
         fullScreenByDefault: false,
         allowedScreenSleep: false,
+        expandToFill: true,
         controlsConfiguration: BetterPlayerControlsConfiguration(
+          showControls: false,
           showControlsOnInitialize: false,
           enableFullscreen: false,
-          enableProgressBar: true,
+          enableProgressBar: false,
           enableSkips: false,
-          enableMute: true,
+          enableMute: false,
           enablePlaybackSpeed: false,
-          progressBarPlayedColor: Colors.white,
-          progressBarBufferedColor: Colors.white30,
           controlBarColor: Colors.transparent,
         ),
       );
@@ -116,16 +134,20 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       _controller.addEventsListener(_onPlayerEvent);
 
       await _controller.setupDataSource(dataSource);
+      // Belt-and-suspenders: override aspect at runtime too, in case the
+      // source video's intrinsic aspect would otherwise re-shape the box.
+      _controller.setOverriddenAspectRatio(screenAspect);
+
       preloaded?.dispose();
 
       if (mounted) setState(() => _isInitialized = true);
     } catch (e, st) {
       log('[VideoPlayer] HLS init failed: $e\n$st');
-      await _tryFallback(video);
+      await _tryFallback(video, screenAspect);
     }
   }
 
-  Future<void> _tryFallback(VideoItem video) async {
+  Future<void> _tryFallback(VideoItem video, double screenAspect) async {
     try {
       final fallbackUrl = video.streamUrl.replaceFirst(
         '/master.m3u8',
@@ -141,26 +163,28 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         ),
       );
       final config = BetterPlayerConfiguration(
+        aspectRatio: screenAspect,
         fit: BoxFit.cover,
         autoPlay: true,
         looping: false,
         fullScreenByDefault: false,
         allowedScreenSleep: false,
+        expandToFill: true,
         controlsConfiguration: BetterPlayerControlsConfiguration(
+          showControls: false,
           showControlsOnInitialize: false,
           enableFullscreen: false,
-          enableProgressBar: true,
+          enableProgressBar: false,
           enableSkips: false,
-          enableMute: true,
+          enableMute: false,
           enablePlaybackSpeed: false,
-          progressBarPlayedColor: Colors.white,
-          progressBarBufferedColor: Colors.white30,
           controlBarColor: Colors.transparent,
         ),
       );
       _controller = BetterPlayerController(config);
       _controller.addEventsListener(_onPlayerEvent);
       await _controller.setupDataSource(dataSource);
+      _controller.setOverriddenAspectRatio(screenAspect);
       if (mounted) setState(() => _isInitialized = true);
     } catch (e) {
       log('[VideoPlayer] Fallback failed: $e');
@@ -171,6 +195,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   void _onPlayerEvent(BetterPlayerEvent event) {
     switch (event.betterPlayerEventType) {
       case BetterPlayerEventType.initialized:
+        if (mounted) {
+          final screen = MediaQuery.of(context).size;
+          final screenAspect = screen.width / screen.height;
+          _controller.setOverriddenAspectRatio(screenAspect);
+        }
         _selectPreferredAudioTrack();
         break;
       case BetterPlayerEventType.progress:
@@ -220,7 +249,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     matchReason ??= 'first available (${match.language ?? '?'})';
 
     log('[VideoPlayer] Audio track selected: $matchReason');
-    _controller.setAudioTrack(match);
+    // setAudioTrack throws MissingPluginException on iOS (better_player_plus
+    // doesn't implement it natively). Swallow it — the server now bakes the
+    // right language as DEFAULT=YES into master.m3u8, so the player picks
+    // the right track automatically and this call is best-effort backup.
+    try {
+      _controller.setAudioTrack(match);
+    } catch (e) {
+      log('[VideoPlayer] setAudioTrack ignored (platform): $e');
+    }
   }
 
   BetterPlayerAsmsAudioTrack? _firstWhereLang(
@@ -303,7 +340,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
               onRetry: () => _initPlayer(_currentVideo),
             )
           else if (_isInitialized)
-            _PlayerView(controller: _controller)
+            Positioned.fill(child: _PlayerView(controller: _controller))
           else
             const Center(
               child: CircularProgressIndicator(color: Colors.white54),
@@ -323,13 +360,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                 Navigator.of(context).pop();
               },
             ),
-          ),
-
-          // ── Side actions ─────────────────────────────────────────────
-          Positioned(
-            right: 14,
-            bottom: 210,
-            child: _SideActions(accent: _accent),
           ),
 
           // ── Bottom overlay ───────────────────────────────────────────
@@ -357,6 +387,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 }
 
 // ── Player view ──────────────────────────────────────────────────────
+// Instagram-reel style: 9:16 video fills the entire screen on every phone.
+// The controller is configured with `aspectRatio = screen.aspectRatio` and
+// `fit: BoxFit.cover`, so BetterPlayer's own AspectRatio widget already
+// matches the screen and the video pixels cover it (cropping sides).
+// We just expand to fill the parent and clip any overflow.
 
 class _PlayerView extends StatelessWidget {
   final BetterPlayerController controller;
@@ -364,9 +399,8 @@ class _PlayerView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: AspectRatio(
-        aspectRatio: 9 / 16,
+    return ClipRect(
+      child: SizedBox.expand(
         child: BetterPlayer(controller: controller),
       ),
     );
@@ -441,58 +475,6 @@ class _TopBar extends StatelessWidget {
           ),
         ],
       ),
-    );
-  }
-}
-
-// ── Side actions ─────────────────────────────────────────────────────
-
-class _SideActions extends StatelessWidget {
-  final Color accent;
-  const _SideActions({required this.accent});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _SideButton(icon: Icons.bookmark_border_rounded, label: 'Save'),
-        const SizedBox(height: 16),
-        _SideButton(icon: Icons.share_outlined, label: 'Share'),
-      ],
-    );
-  }
-}
-
-class _SideButton extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _SideButton({required this.icon, required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 38,
-          height: 38,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: Colors.white.withValues(alpha: 0.10),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
-          ),
-          child: Icon(icon, color: Colors.white.withValues(alpha: 0.75), size: 17),
-        ),
-        const SizedBox(height: 3),
-        Text(
-          label,
-          style: VirtualHelpTheme.sans(
-            size: 8,
-            color: Colors.white.withValues(alpha: 0.5),
-          ),
-        ),
-      ],
     );
   }
 }

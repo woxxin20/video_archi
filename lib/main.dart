@@ -9,8 +9,9 @@ void main() async {
   // Override per environment:
   //   const String.fromEnvironment('VH_SERVER_URL') → --dart-define=VH_SERVER_URL=...
   const overrideUrl = String.fromEnvironment('VH_SERVER_URL');
-  VirtualHelpConfig.serverBaseUrl =
-      overrideUrl.isNotEmpty ? overrideUrl : 'http://192.168.1.57:8080';
+  VirtualHelpConfig.serverBaseUrl = overrideUrl.isNotEmpty
+      ? overrideUrl
+      : 'http://192.168.1.50:8080';
 
   // Initialize database
   await VirtualHelp.ensureInitialized();
