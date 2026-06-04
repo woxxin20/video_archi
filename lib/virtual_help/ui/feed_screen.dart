@@ -3,9 +3,10 @@ import 'package:provider/provider.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 
 import '../config.dart';
+import '../models/feed_entry.dart';
 import '../providers/virtual_help_provider.dart';
-import '../models/video_item.dart';
 import 'video_card_widget.dart';
+import 'video_player_screen.dart';
 import 'offline_widget.dart';
 import 'virtual_help_theme.dart';
 
@@ -334,43 +335,37 @@ class _VirtualHelpSection extends StatelessWidget {
     ];
   }
 
-  List<_SlottedVideo> _buildSlots() {
+  /// Flat list of EVERY video shown today across every category.
+  /// Order: by category in catalog order, slot-by-slot.
+  /// Used when the user taps any card — the player shows them all and
+  /// opens on the tapped one (Instagram-Reels style).
+  List<_SlottedVideo> _allTodayVideos() {
     final result = <_SlottedVideo>[];
-
-    if (selectedCategory == 'all') {
-      for (final cat in provider.currentCategories) {
-        final slots = provider.getFeedForCategory(cat);
-        for (int i = 0; i < slots.length; i++) {
-          result.add(
-            _SlottedVideo(
-              slot: slots[i],
-              category: cat,
-              isToday: i == 0 && !slots[i].isRewatch,
-              allInCategory: slots.map((s) => s.video).toList(),
-            ),
-          );
-        }
-      }
-    } else {
-      final slots = provider.getFeedForCategory(selectedCategory);
+    for (final cat in provider.currentCategories) {
+      final slots = provider.getFeedForCategory(cat);
       for (int i = 0; i < slots.length; i++) {
-        result.add(
-          _SlottedVideo(
-            slot: slots[i],
-            category: selectedCategory,
-            isToday: i == 0 && !slots[i].isRewatch,
-            allInCategory: slots.map((s) => s.video).toList(),
-          ),
-        );
+        result.add(_SlottedVideo(
+          slot: slots[i],
+          category: cat,
+          isToday: i == 0 && !slots[i].isRewatch,
+        ));
       }
     }
-
     return result;
+  }
+
+  /// What the horizontal strip in the feed actually renders.
+  /// Subset of [_allTodayVideos] filtered by the selected category pill.
+  List<_SlottedVideo> _visibleSlots() {
+    final all = _allTodayVideos();
+    if (selectedCategory == 'all') return all;
+    return all.where((sv) => sv.category == selectedCategory).toList();
   }
 
   @override
   Widget build(BuildContext context) {
-    final slots = _buildSlots();
+    final slots = _visibleSlots();
+    final allToday = _allTodayVideos();
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -527,13 +522,46 @@ class _VirtualHelpSection extends StatelessWidget {
                     isRewatch: sv.slot.isRewatch,
                     category: sv.category,
                     isToday: sv.isToday,
-                    categoryVideos: sv.allInCategory,
+                    onTap: () => _openReels(context, allToday, sv),
                   ),
                 );
               }).toList(),
             ),
           ),
       ],
+    );
+  }
+
+  /// Push the full-screen reels player with EVERY today's video, opening on
+  /// the one the user tapped — Instagram-Reels style cross-category swipe.
+  void _openReels(
+    BuildContext context,
+    List<_SlottedVideo> allToday,
+    _SlottedVideo tapped,
+  ) {
+    if (allToday.isEmpty) return;
+    final entries = [
+      for (final sv in allToday)
+        FeedEntry(
+          video: sv.slot.video,
+          category: sv.category,
+          isRewatch: sv.slot.isRewatch,
+        ),
+    ];
+    var initialIndex = allToday.indexWhere(
+      (sv) =>
+          sv.slot.video.id == tapped.slot.video.id &&
+          sv.category == tapped.category,
+    );
+    if (initialIndex < 0) initialIndex = 0;
+
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => VideoPlayerScreen(
+          entries: entries,
+          initialIndex: initialIndex,
+        ),
+      ),
     );
   }
 
@@ -571,12 +599,10 @@ class _SlottedVideo {
   final FeedSlot slot;
   final String category;
   final bool isToday;
-  final List<VideoItem> allInCategory;
   const _SlottedVideo({
     required this.slot,
     required this.category,
     required this.isToday,
-    required this.allInCategory,
   });
 }
 

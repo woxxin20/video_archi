@@ -1,5 +1,5 @@
 {
-  "catalog_version": "2026-06-02-hls-v2",
+  "catalog_version": "2026-06-04-direct-cdn-v3",
   "period": {
     "tips":      ["001", "002", "003"],
     "awareness": ["001", "002", "003"],

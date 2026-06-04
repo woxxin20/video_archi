@@ -161,9 +161,10 @@ class VirtualHelpProvider extends ChangeNotifier {
     try {
       final cached = CatalogResponse.fromJson(json);
 
-      // Schema-drift guard: if cached stream_urls don't point at the current
-      // server's /hls/ endpoint, drop the cache so we re-fetch and pick up
-      // the new format (this handles the v1 → /hls/ migration cleanly).
+      // Schema-drift guard: if cached stream_urls still go through the legacy
+      // /hls/ proxy endpoint (which has been removed in favour of pointing
+      // straight at the CDN's native master.m3u8), drop the cache so the
+      // device re-fetches with the correct direct-CDN URLs.
       String? sampleStreamUrl;
       for (final c in cached.categories.values) {
         for (final v in c.videos) {
@@ -174,9 +175,9 @@ class VirtualHelpProvider extends ChangeNotifier {
         }
         if (sampleStreamUrl != null) break;
       }
-      if (sampleStreamUrl != null && !sampleStreamUrl.contains('/hls/')) {
+      if (sampleStreamUrl != null && sampleStreamUrl.contains('/hls/')) {
         debugPrint(
-            '[Provider] Cached catalog uses legacy stream_url, invalidating');
+            '[Provider] Cached catalog uses legacy /hls/ endpoint, invalidating');
         await _db.deleteCatalog(mode, _currentLang);
         // Also reset stored version so next sync re-fetches
         final prefs = await SharedPreferences.getInstance();

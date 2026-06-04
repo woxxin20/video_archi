@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 
 import '../models/video_item.dart';
-import 'video_player_screen.dart';
 import 'virtual_help_theme.dart';
 
 /// Badge type to show on a video card.
@@ -22,16 +21,17 @@ class VideoCardWidget extends StatelessWidget {
   /// Show the "Watch Now" + TODAY badge (first unwatched in feed).
   final bool isToday;
 
-  /// All videos in this category — passed to player for Prev/Next nav.
-  final List<VideoItem> categoryVideos;
+  /// Called when the card is tapped. The parent owns navigation so it can
+  /// build the cross-category "all of today" reel list before pushing.
+  final VoidCallback onTap;
 
   const VideoCardWidget({
     super.key,
     required this.video,
     required this.isRewatch,
     required this.category,
+    required this.onTap,
     this.isToday = false,
-    this.categoryVideos = const [],
   });
 
   Color get _accent =>
@@ -66,15 +66,7 @@ class VideoCardWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: () => Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => VideoPlayerScreen(
-            video: video,
-            category: category,
-            categoryVideos: categoryVideos,
-          ),
-        ),
-      ),
+      onTap: onTap,
       child: Opacity(
         opacity: isRewatch ? 0.5 : 1.0,
         child: Container(
