@@ -15,7 +15,7 @@ late String _catalogVersion;
 
 /// Default CDN base URL — the public host that serves /videos/<mode>/<cat>/<id>/master.m3u8 etc.
 /// Override at runtime via `dart run bin/server.dart <cdn_base_url>` or the CDN_BASE_URL env var.
-String _cdnBaseUrl = 'http://192.168.1.57';
+String _cdnBaseUrl = 'http://192.168.1.104';
 final Map<String, Map<String, dynamic>> _catalogCache = {};
 
 void main(List<String> args) async {
@@ -42,10 +42,12 @@ void main(List<String> args) async {
   final router = Router();
   router.get('/api/catalog', _handleCatalog);
   router.get('/api/catalog_version', _handleCatalogVersion);
-  // Dynamically-generated HLS master playlist — sets DEFAULT=YES on the
-  // requested audio language so players honour it without programmatic
-  // setAudioTrack() (which is broken on iOS in better_player_plus).
-  router.get('/hls/<mode>/<cat>/<id>/master.m3u8', _handleHlsMaster);
+  // PROXIES the CDN's REAL master.m3u8 — only flips DEFAULT=YES onto the
+  // requested audio language and absolutises relative URIs. Preserves
+  // every audio variant exactly as authored on the CDN, so native HLS
+  // players (including iOS, where setAudioTrack is broken) play the
+  // right language without any runtime track-switch call.
+  router.get('/hls/<mode>/<cat>/<id>/master.m3u8', _handleHlsProxy);
   router.get(
       '/health',
       (Request _) => Response.ok(
@@ -247,11 +249,13 @@ Map<String, dynamic> _buildCatalog(
         'title': _resolveText(tKey, langResolved),
         'description': _resolveText(dKey, langResolved),
         'duration_sec': _videoDurations[fid] ?? 60,
-        // stream_url points at the API server's /hls/ endpoint, which generates
-        // master.m3u8 on-the-fly with the right language baked as DEFAULT=YES.
-        // This eliminates the need for setAudioTrack() (which doesn't work on
-        // iOS in better_player_plus) and lets the player just play.
-        'stream_url': '$apiBase/hls/$fid/master.m3u8?audio=$preferredAudioLang',
+        // stream_url goes through this server's /hls/ PROXY endpoint, which
+        // fetches the CDN's REAL m3u8 and flips DEFAULT=YES onto the right
+        // language. iOS plays the correct language natively (no
+        // setAudioTrack call), and the CDN's audio variant paths/URIs are
+        // preserved exactly as authored.
+        'stream_url':
+            '$apiBase/hls/$fid/master.m3u8?audio=$preferredAudioLang',
         'thumbnail_url': '$_cdnBaseUrl/videos/$fid/thumb.webp',
         'preferred_audio_lang': preferredAudioLang,
         'available_audio_langs': availableAudioLangs,
@@ -282,81 +286,85 @@ String _resolveText(String key, String lang) {
 }
 
 // ─── GET /hls/<mode>/<cat>/<id>/master.m3u8?audio=<lang> ───
-/// Returns an HLS master playlist constructed on-the-fly so that the
-/// requested audio language is marked DEFAULT=YES (and AUTOSELECT=YES).
-/// All sub-paths (video, audio segment playlists) are emitted as
-/// absolute URLs pointing at the CDN, so no further proxying is needed.
-Response _handleHlsMaster(Request request, String mode, String cat, String id) {
-  final fullId = '$mode/$cat/$id';
-  final available = _videoLanguages[fullId] ?? const ['en'];
-  final reqAudio = (request.url.queryParameters['audio'] ?? 'en').toLowerCase();
+/// Fetches the CDN's actual master.m3u8 for this video and rewrites just
+/// two things before serving:
+///   1. DEFAULT=YES is moved onto the audio track whose LANGUAGE matches
+///      the request (every other variant becomes DEFAULT=NO). Native HLS
+///      players honour this without any extra API call → solves audio
+///      switching on iOS where better_player_plus's setAudioTrack throws.
+///   2. Every relative URI ("audio/<lang>/stream.m3u8", "video/stream.m3u8")
+///      is absolutised against the CDN base so the player resolves variant
+///      playlists against the CDN itself, not this API server.
+///
+/// If the upstream fetch fails (timeout, 404, etc.) we 302-redirect to
+/// the raw CDN URL so playback still works (just without language
+/// switching) instead of returning a hard error.
+Future<Response> _handleHlsProxy(
+    Request request, String mode, String cat, String id) async {
+  final fid = '$mode/$cat/$id';
+  final reqAudio =
+      (request.url.queryParameters['audio'] ?? 'en').toLowerCase();
+  final base = '$_cdnBaseUrl/videos/$fid';
+  final cdnUrl = '$base/master.m3u8';
 
-  // Same fallback chain as catalog: requested → hi → en → first available.
-  String chosen;
-  if (available.contains(reqAudio)) {
-    chosen = reqAudio;
-  } else if (available.contains('hi')) {
-    chosen = 'hi';
-  } else if (available.contains('en')) {
-    chosen = 'en';
-  } else {
-    chosen = available.first;
+  String upstream;
+  try {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 5);
+    final req = await client.getUrl(Uri.parse(cdnUrl));
+    final resp = await req.close().timeout(const Duration(seconds: 5));
+    if (resp.statusCode != 200) {
+      client.close(force: true);
+      return Response.found(cdnUrl);
+    }
+    upstream = await resp.transform(utf8.decoder).join();
+    client.close();
+  } catch (e) {
+    print('[HLS proxy] upstream fetch failed for $cdnUrl → $e (falling back)');
+    return Response.found(cdnUrl);
   }
 
-  final base = '$_cdnBaseUrl/videos/$fullId';
-  final buf = StringBuffer()
-    ..writeln('#EXTM3U')
-    ..writeln('#EXT-X-VERSION:6');
+  final rewritten = upstream.split('\n').map((rawLine) {
+    var line = rawLine;
+    final trimmed = line.trim();
 
-  for (final lang in available) {
-    final isDefault = lang == chosen ? 'YES' : 'NO';
-    final name = _langDisplayName(lang);
-    buf.writeln(
-        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",LANGUAGE="$lang",NAME="$name",DEFAULT=$isDefault,AUTOSELECT=YES,URI="$base/audio/$lang/stream.m3u8"');
-  }
+    if (trimmed.startsWith('#EXT-X-MEDIA:') &&
+        trimmed.contains('TYPE=AUDIO')) {
+      // 1. Set DEFAULT based on whether this line's LANGUAGE matches.
+      final langMatch = RegExp(r'LANGUAGE="([^"]+)"').firstMatch(line);
+      if (langMatch != null) {
+        final lineLang = langMatch.group(1)!.toLowerCase();
+        final isDefault = lineLang == reqAudio;
+        if (RegExp(r'DEFAULT=(YES|NO)').hasMatch(line)) {
+          line = line.replaceAll(RegExp(r'DEFAULT=(YES|NO)'),
+              'DEFAULT=${isDefault ? 'YES' : 'NO'}');
+        } else {
+          line = line.replaceFirst('AUTOSELECT=',
+              'DEFAULT=${isDefault ? 'YES' : 'NO'},AUTOSELECT=');
+        }
+      }
+      // 2. Absolutise URI="audio/xx/stream.m3u8" → CDN URL.
+      line = line.replaceAllMapped(RegExp(r'URI="([^"]+)"'), (m) {
+        final u = m.group(1)!;
+        if (u.startsWith('http://') || u.startsWith('https://')) {
+          return 'URI="$u"';
+        }
+        return 'URI="$base/$u"';
+      });
+    } else if (trimmed.isNotEmpty && !trimmed.startsWith('#')) {
+      // Variant stream URL line — absolutise if relative.
+      if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+        line = '$base/$trimmed';
+      }
+    }
+    return line;
+  }).join('\n');
 
-  buf
-    ..writeln(
-        '#EXT-X-STREAM-INF:BANDWIDTH=1200000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio",RESOLUTION=1080x1920')
-    ..writeln('$base/video/stream.m3u8');
-
-  return Response.ok(buf.toString(), headers: {
+  return Response.ok(rewritten, headers: {
     'Content-Type': 'application/vnd.apple.mpegurl',
     'Cache-Control': 'public, max-age=60',
   });
 }
-
-const _langNames = {
-  'en': 'English',
-  'hi': 'Hindi',
-  'gu': 'Gujarati',
-  'mr': 'Marathi',
-  'ta': 'Tamil',
-  'te': 'Telugu',
-  'bn': 'Bengali',
-  'pa': 'Punjabi',
-  'ur': 'Urdu',
-  'ar': 'Arabic',
-  'fr': 'French',
-  'es': 'Spanish',
-  'de': 'German',
-  'pt': 'Portuguese',
-  'ru': 'Russian',
-  'zh': 'Chinese',
-  'ja': 'Japanese',
-  'ko': 'Korean',
-  'id': 'Indonesian',
-  'tr': 'Turkish',
-  'sw': 'Swahili',
-  'vi': 'Vietnamese',
-  'fa': 'Persian',
-  'am': 'Amharic',
-  'af': 'Afrikaans',
-  'tl': 'Filipino',
-  'th': 'Thai',
-};
-
-String _langDisplayName(String code) => _langNames[code] ?? code.toUpperCase();
 
 String _resolveAudioLang(String fullId, String reqLang) {
   final avail = _videoLanguages[fullId] ?? ['en'];

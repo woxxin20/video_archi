@@ -1,5 +1,5 @@
 {
-  "catalog_version": "2026-06-05-proxy-rewrite-v4",
+  "catalog_version": "2026-06-05-proxy-rewrite-v5",
   "period": {
     "tips":      ["001", "002", "003"],
     "awareness": ["001", "002", "003"],
