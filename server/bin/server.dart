@@ -42,12 +42,18 @@ void main(List<String> args) async {
   final router = Router();
   router.get('/api/catalog', _handleCatalog);
   router.get('/api/catalog_version', _handleCatalogVersion);
-  // Proxies the CDN's master.m3u8 and flips DEFAULT=YES onto the
-  // requested audio LANGUAGE. Every URI in the served m3u8 points
-  // STRAIGHT AT THE CDN (audio/video sub-playlists and segments stream
-  // directly from $cdnBaseUrl). The phone only hits this server for the
-  // master playlist — sub-resources hit the CDN.
+  // Proxies the CDN's master.m3u8 and flips DEFAULT=YES per language.
   router.get('/hls/<mode>/<cat>/<id>/master.m3u8', _handleHlsProxy);
+  // Generic CDN tunnel. Required because:
+  //  - XAMPP serves .ts with NO Content-Type → iOS AVPlayer rejects HLS.
+  //    The tunnel injects video/mp2t, audio/aac, etc.
+  //  - When sub-playlists are served, segment URIs inside them are
+  //    rewritten to ABSOLUTE /cdn/ URLs (with the :8080 port). This
+  //    avoids iOS AVPlayer's relative-URL port-stripping bug, where
+  //    `seg_000.ts` resolved against a non-standard-port playlist URL
+  //    loses the port and ends up at port 80.
+  router.get('/cdn/<path|.*>', _handleCdnProxy);
+  router.head('/cdn/<path|.*>', _handleCdnProxy);
   router.get(
       '/health',
       (Request _) => Response.ok(
@@ -290,21 +296,22 @@ final HttpClient _upstreamClient = HttpClient()
   ..connectionTimeout = const Duration(seconds: 10)
   ..idleTimeout = const Duration(seconds: 30);
 
+/// Derive this server's public base URL from the incoming request so
+/// rewritten URIs are reachable from the device that asked.
+String _publicApiBase(Request request) {
+  final scheme = request.headers['x-forwarded-proto'] ?? 'http';
+  final host = request.headers['x-forwarded-host'] ??
+      request.headers['host'] ??
+      'localhost:8080';
+  return '$scheme://$host';
+}
+
 // ─── GET /hls/<mode>/<cat>/<id>/master.m3u8?audio=<lang> ───
-/// Fetches the CDN's REAL master.m3u8 for this video. Mutates only two
-/// things before serving:
-///   1. DEFAULT=YES is set on the audio track whose LANGUAGE matches the
-///      request; every other variant becomes DEFAULT=NO. Native HLS
-///      players honour this without any setAudioTrack() call — works on
-///      iOS where better_player_plus's audio-track API is broken.
-///   2. Every relative URI in the playlist is absolutised against the
-///      CDN base so the player resolves sub-playlists and segments
-///      STRAIGHT from the CDN (not back through this server, which
-///      would force a non-standard port and trigger AVPlayer's
-///      port-stripping bug when resolving relative URLs).
-///
-/// On upstream failure we 302-redirect to the CDN's raw m3u8 so playback
-/// still works (just without the language swap).
+/// Fetches the CDN's REAL master.m3u8, flips DEFAULT=YES per language,
+/// and rewrites every sub-URI to go through this server's /cdn/ tunnel
+/// as ABSOLUTE URLs (with full :port). That avoids iOS AVPlayer's
+/// relative-URL port-stripping bug + lets the tunnel fix missing
+/// Content-Types on .ts/.aac segments.
 Future<Response> _handleHlsProxy(
     Request request, String mode, String cat, String id) async {
   final fid = '$mode/$cat/$id';
@@ -312,6 +319,7 @@ Future<Response> _handleHlsProxy(
       (request.url.queryParameters['audio'] ?? 'en').toLowerCase();
   final cdnBase = '$_cdnBaseUrl/videos/$fid';
   final cdnUrl = '$cdnBase/master.m3u8';
+  final tunnelBase = '${_publicApiBase(request)}/cdn/$fid';
 
   String upstream;
   try {
@@ -346,18 +354,18 @@ Future<Response> _handleHlsProxy(
               'DEFAULT=${isDefault ? 'YES' : 'NO'},AUTOSELECT=');
         }
       }
-      // 2. Absolutise URI="audio/xx/stream.m3u8" → direct CDN URL.
+      // 2. Rewrite URI through /cdn/ tunnel as ABSOLUTE URL.
       line = line.replaceAllMapped(RegExp(r'URI="([^"]+)"'), (m) {
         final u = m.group(1)!;
         if (u.startsWith('http://') || u.startsWith('https://')) {
           return 'URI="$u"';
         }
-        return 'URI="$cdnBase/$u"';
+        return 'URI="$tunnelBase/$u"';
       });
     } else if (trimmed.isNotEmpty && !trimmed.startsWith('#')) {
-      // Variant stream URL line — point straight at CDN if relative.
+      // Variant stream URL line — through tunnel as ABSOLUTE URL.
       if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-        line = '$cdnBase/$trimmed';
+        line = '$tunnelBase/$trimmed';
       }
     }
     return line;
@@ -367,6 +375,109 @@ Future<Response> _handleHlsProxy(
     'Content-Type': 'application/vnd.apple.mpegurl',
     'Cache-Control': 'public, max-age=60',
   });
+}
+
+// ─── GET/HEAD /cdn/<path> ───
+/// Tunnels content from the CDN with three iOS-critical fixes:
+///   1. Forces correct Content-Type on .m3u8/.ts/.aac (XAMPP serves
+///      .ts with no MIME at all, which AVPlayer rejects).
+///   2. When serving an .m3u8 sub-playlist, rewrites relative segment
+///      URIs to ABSOLUTE /cdn/ URLs (with full :port) so AVPlayer
+///      doesn't strip the port during relative resolution.
+///   3. Forwards Range / If-* headers so byte-range playback works.
+Future<Response> _handleCdnProxy(Request request, String path) async {
+  final upstream = '$_cdnBaseUrl/videos/$path';
+  try {
+    final isHead = request.method == 'HEAD';
+    final req = isHead
+        ? await _upstreamClient.headUrl(Uri.parse(upstream))
+        : await _upstreamClient.getUrl(Uri.parse(upstream));
+
+    const fwd = ['range', 'if-range', 'if-modified-since', 'if-none-match'];
+    for (final h in fwd) {
+      final v = request.headers[h];
+      if (v != null) req.headers.set(h, v);
+    }
+    req.headers.set(HttpHeaders.userAgentHeader, 'virtual_help_server/1.0');
+
+    final resp = await req.close().timeout(const Duration(seconds: 30));
+
+    final outHeaders = <String, String>{};
+    const stripped = {
+      'transfer-encoding',
+      'connection',
+      'keep-alive',
+      'content-length',
+      'content-encoding',
+      'proxy-authenticate',
+      'proxy-authorization',
+      'te',
+      'trailers',
+      'upgrade',
+    };
+    resp.headers.forEach((name, values) {
+      if (stripped.contains(name.toLowerCase())) return;
+      outHeaders[name] = values.join(',');
+    });
+
+    // Force correct Content-Type by extension.
+    if (path.endsWith('.m3u8')) {
+      outHeaders['content-type'] = 'application/vnd.apple.mpegurl';
+    } else if (path.endsWith('.ts')) {
+      outHeaders['content-type'] = 'video/mp2t';
+    } else if (path.endsWith('.aac')) {
+      outHeaders['content-type'] = 'audio/aac';
+    } else if (path.endsWith('.webp')) {
+      outHeaders['content-type'] = 'image/webp';
+    } else if (path.endsWith('.jpg') || path.endsWith('.jpeg')) {
+      outHeaders['content-type'] = 'image/jpeg';
+    }
+
+    if (isHead) {
+      await resp.drain();
+      return Response(resp.statusCode, headers: outHeaders);
+    }
+
+    // For .m3u8 sub-playlists, rewrite segment URIs to ABSOLUTE /cdn/
+    // URLs (with full port) so iOS AVPlayer never has to do relative URL
+    // resolution against a non-standard-port host.
+    if (path.endsWith('.m3u8')) {
+      final body = await resp.transform(utf8.decoder).join();
+      // The /cdn/ base whose path leads here, sans the playlist filename.
+      // path is e.g. "period/tips/001/audio/hi/stream.m3u8".
+      final lastSlash = path.lastIndexOf('/');
+      final pathDir = lastSlash >= 0 ? path.substring(0, lastSlash) : '';
+      final tunnelBase = '${_publicApiBase(request)}/cdn/$pathDir';
+      final rewritten = body.split('\n').map((rawLine) {
+        var line = rawLine;
+        final trimmed = line.trim();
+        // Rewrite URI="..." inside tags.
+        if (trimmed.startsWith('#') && line.contains('URI="')) {
+          line = line.replaceAllMapped(RegExp(r'URI="([^"]+)"'), (m) {
+            final u = m.group(1)!;
+            if (u.startsWith('http://') || u.startsWith('https://')) {
+              return 'URI="$u"';
+            }
+            return 'URI="$tunnelBase/$u"';
+          });
+        } else if (trimmed.isNotEmpty && !trimmed.startsWith('#')) {
+          if (!trimmed.startsWith('http://') &&
+              !trimmed.startsWith('https://')) {
+            line = '$tunnelBase/$trimmed';
+          }
+        }
+        return line;
+      }).join('\n');
+      outHeaders.remove('content-length');
+      return Response(resp.statusCode, body: rewritten, headers: outHeaders);
+    }
+
+    // Binary segments: stream straight through.
+    return Response(resp.statusCode, body: resp, headers: outHeaders);
+  } catch (e) {
+    print('[CDN proxy] $path → $e');
+    return Response(502, body: 'Upstream CDN error: $e');
+  }
 }
 
 String _resolveAudioLang(String fullId, String reqLang) {

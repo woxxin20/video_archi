@@ -1,5 +1,5 @@
 {
-  "catalog_version": "2026-06-05-direct-cdn-v7",
+  "catalog_version": "2026-06-05-tunnel-abs-v8",
   "period": {
     "tips":      ["001", "002", "003"],
     "awareness": ["001", "002", "003"],
