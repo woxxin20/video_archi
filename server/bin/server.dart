@@ -42,12 +42,16 @@ void main(List<String> args) async {
   final router = Router();
   router.get('/api/catalog', _handleCatalog);
   router.get('/api/catalog_version', _handleCatalogVersion);
-  // PROXIES the CDN's REAL master.m3u8 — only flips DEFAULT=YES onto the
-  // requested audio language and absolutises relative URIs. Preserves
-  // every audio variant exactly as authored on the CDN, so native HLS
-  // players (including iOS, where setAudioTrack is broken) play the
-  // right language without any runtime track-switch call.
+  // Proxies the CDN's master.m3u8, flips DEFAULT=YES per language, and
+  // rewrites all sub-paths so they go back through /cdn/ on THIS server.
   router.get('/hls/<mode>/<cat>/<id>/master.m3u8', _handleHlsProxy);
+  // Generic byte-streaming proxy for anything under the CDN's /videos/
+  // tree. Supports HEAD + Range so HLS playback (which uses byte-range
+  // requests for .ts/.aac segments) works on iOS. Lets the phone reach
+  // every HLS resource through ONE host (the API server) even when the
+  // CDN host is unreachable from the device.
+  router.get('/cdn/<path|.*>', _handleCdnProxy);
+  router.head('/cdn/<path|.*>', _handleCdnProxy);
   router.get(
       '/health',
       (Request _) => Response.ok(
@@ -285,6 +289,11 @@ String _resolveText(String key, String lang) {
   return key;
 }
 
+// One shared HttpClient — kept warm across requests for keep-alive reuse.
+final HttpClient _upstreamClient = HttpClient()
+  ..connectionTimeout = const Duration(seconds: 10)
+  ..idleTimeout = const Duration(seconds: 30);
+
 // ─── GET /hls/<mode>/<cat>/<id>/master.m3u8?audio=<lang> ───
 /// Fetches the CDN's actual master.m3u8 for this video and rewrites just
 /// two things before serving:
@@ -293,8 +302,9 @@ String _resolveText(String key, String lang) {
 ///      players honour this without any extra API call → solves audio
 ///      switching on iOS where better_player_plus's setAudioTrack throws.
 ///   2. Every relative URI ("audio/<lang>/stream.m3u8", "video/stream.m3u8")
-///      is absolutised against the CDN base so the player resolves variant
-///      playlists against the CDN itself, not this API server.
+///      is rewritten to point at THIS server's /cdn/ tunnel, so the device
+///      only needs to reach one host (the API server) instead of also
+///      being able to talk to the CDN host directly.
 ///
 /// If the upstream fetch fails (timeout, 404, etc.) we 302-redirect to
 /// the raw CDN URL so playback still works (just without language
@@ -304,21 +314,21 @@ Future<Response> _handleHlsProxy(
   final fid = '$mode/$cat/$id';
   final reqAudio =
       (request.url.queryParameters['audio'] ?? 'en').toLowerCase();
-  final base = '$_cdnBaseUrl/videos/$fid';
-  final cdnUrl = '$base/master.m3u8';
+  final cdnBase = '$_cdnBaseUrl/videos/$fid';
+  final cdnUrl = '$cdnBase/master.m3u8';
+  // The /cdn/ base on THIS server — sub-paths resolve relative to it.
+  final apiBase = _publicApiBase(request);
+  final tunnelBase = '$apiBase/cdn/$fid';
 
   String upstream;
   try {
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 5);
-    final req = await client.getUrl(Uri.parse(cdnUrl));
+    final req = await _upstreamClient.getUrl(Uri.parse(cdnUrl));
     final resp = await req.close().timeout(const Duration(seconds: 5));
     if (resp.statusCode != 200) {
-      client.close(force: true);
+      await resp.drain();
       return Response.found(cdnUrl);
     }
     upstream = await resp.transform(utf8.decoder).join();
-    client.close();
   } catch (e) {
     print('[HLS proxy] upstream fetch failed for $cdnUrl → $e (falling back)');
     return Response.found(cdnUrl);
@@ -343,18 +353,18 @@ Future<Response> _handleHlsProxy(
               'DEFAULT=${isDefault ? 'YES' : 'NO'},AUTOSELECT=');
         }
       }
-      // 2. Absolutise URI="audio/xx/stream.m3u8" → CDN URL.
+      // 2. Rewrite URI="audio/xx/stream.m3u8" → /cdn/ tunnel URL on this server.
       line = line.replaceAllMapped(RegExp(r'URI="([^"]+)"'), (m) {
         final u = m.group(1)!;
         if (u.startsWith('http://') || u.startsWith('https://')) {
           return 'URI="$u"';
         }
-        return 'URI="$base/$u"';
+        return 'URI="$tunnelBase/$u"';
       });
     } else if (trimmed.isNotEmpty && !trimmed.startsWith('#')) {
-      // Variant stream URL line — absolutise if relative.
+      // Variant stream URL line — point through tunnel if relative.
       if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-        line = '$base/$trimmed';
+        line = '$tunnelBase/$trimmed';
       }
     }
     return line;
@@ -364,6 +374,80 @@ Future<Response> _handleHlsProxy(
     'Content-Type': 'application/vnd.apple.mpegurl',
     'Cache-Control': 'public, max-age=60',
   });
+}
+
+// ─── GET/HEAD /cdn/<path> ───
+/// Generic byte-streaming proxy from the CDN's /videos/ tree.
+/// Forwards Range/If-* request headers and preserves response status,
+/// headers, and body so HLS byte-range playback works correctly.
+Future<Response> _handleCdnProxy(Request request, String path) async {
+  final upstream = '$_cdnBaseUrl/videos/$path';
+  try {
+    final isHead = request.method == 'HEAD';
+    final req = isHead
+        ? await _upstreamClient.headUrl(Uri.parse(upstream))
+        : await _upstreamClient.getUrl(Uri.parse(upstream));
+
+    // Forward range / conditional headers so HLS byte-range playback works.
+    final fwd = ['range', 'if-range', 'if-modified-since', 'if-none-match'];
+    for (final h in fwd) {
+      final v = request.headers[h];
+      if (v != null) req.headers.set(h, v);
+    }
+    req.headers.set(HttpHeaders.userAgentHeader, 'virtual_help_server/1.0');
+
+    final resp = await req.close().timeout(const Duration(seconds: 30));
+
+    // Collect response headers but drop hop-by-hop ones.
+    final outHeaders = <String, String>{};
+    const stripped = {
+      'transfer-encoding',
+      'connection',
+      'keep-alive',
+      'proxy-authenticate',
+      'proxy-authorization',
+      'te',
+      'trailers',
+      'upgrade',
+    };
+    resp.headers.forEach((name, values) {
+      if (stripped.contains(name.toLowerCase())) return;
+      outHeaders[name] = values.join(',');
+    });
+
+    // Override Content-Type based on extension so HLS players are happy.
+    if (path.endsWith('.m3u8')) {
+      outHeaders['content-type'] = 'application/vnd.apple.mpegurl';
+    } else if (path.endsWith('.ts')) {
+      outHeaders['content-type'] = 'video/mp2t';
+    } else if (path.endsWith('.aac')) {
+      outHeaders['content-type'] = 'audio/aac';
+    } else if (path.endsWith('.webp')) {
+      outHeaders['content-type'] = 'image/webp';
+    } else if (path.endsWith('.jpg') || path.endsWith('.jpeg')) {
+      outHeaders['content-type'] = 'image/jpeg';
+    }
+
+    if (isHead) {
+      await resp.drain();
+      return Response(resp.statusCode, headers: outHeaders);
+    }
+    // Stream the body straight through.
+    return Response(resp.statusCode, body: resp, headers: outHeaders);
+  } catch (e) {
+    print('[CDN proxy] $path → $e');
+    return Response(502, body: 'Upstream CDN error: $e');
+  }
+}
+
+/// Derive this server's public base URL from the incoming request so
+/// rewritten URIs are reachable from the device that asked.
+String _publicApiBase(Request request) {
+  final scheme = request.headers['x-forwarded-proto'] ?? 'http';
+  final host = request.headers['x-forwarded-host'] ??
+      request.headers['host'] ??
+      'localhost:8080';
+  return '$scheme://$host';
 }
 
 String _resolveAudioLang(String fullId, String reqLang) {
