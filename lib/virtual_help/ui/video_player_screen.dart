@@ -63,12 +63,26 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   // Number of pages to keep alive on each side of the current page.
   static const int _keepAliveRadius = 1;
 
+  // True once we've warmed the initial controllers — guards against
+  // didChangeDependencies firing multiple times (e.g. MediaQuery changes).
+  bool _didFirstWarm = false;
+
   @override
   void initState() {
     super.initState();
     _currentIndex = widget.initialIndex.clamp(0, widget.entries.length - 1);
     _pageController = PageController(initialPage: _currentIndex);
-    _warmControllersAround(_currentIndex);
+    // NOTE: warming happens in didChangeDependencies because it needs
+    // MediaQuery.of(context), which isn't safe to call in initState.
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_didFirstWarm) {
+      _didFirstWarm = true;
+      _warmControllersAround(_currentIndex);
+    }
   }
 
   @override
